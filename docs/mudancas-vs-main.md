@@ -1,8 +1,18 @@
-# O que esta branch muda em relação à `main`, e por quê
+# O que foi mudado desde o estado inicial, e por quê
 
-A `main` é um commit único (`8b66dfc`), o estado inicial do projeto: um sampler
-que tocava, com um bug de disparo, ~47 ms de latência e nenhuma verificação
-automatizada. Esta branch corrige isso e documenta o que foi medido.
+Este documento nasceu comparando com a `main`, quando ela era um commit único
+(`8b66dfc`): um sampler que tocava, com um bug de disparo, ~47 ms de latência e
+nenhuma verificação automatizada.
+
+**A `main` andou desde então.** Em 11/10/2026 ela está em `98966ad` e já contém
+as áreas **1 a 11** abaixo. O que a branch `feat/mixer-gain-staging` acrescenta
+por cima da `main` são as áreas **12, 13 e 14** — o pin da M16, o motor de
+blocos em float e o pitch shifter — mais o registro de bancada que as
+acompanha.
+
+As áreas 1–11 ficam aqui porque a justificativa delas continua sendo a única
+explicação escrita de por que o firmware é como é. Este arquivo é o histórico
+de decisões do projeto, não o diff de uma branch.
 
 Resumo das áreas, cada uma justificada abaixo:
 
