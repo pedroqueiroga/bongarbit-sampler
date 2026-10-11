@@ -89,4 +89,19 @@ struct TriggerInput {
     }
     return false;
   }
+
+  // The same state read as a LEVEL instead of an edge: true from the poll a
+  // strike is confirmed until the raw pin has read HIGH continuously for
+  // release_ms. For a hold-to-engage control (GPIO7 runs the pitch shifter
+  // while pressed) rather than a one-shot strike.
+  //
+  // Deliberately an accessor on this machine and not a second machine. A hold
+  // needs exactly the conditioning a strike needs - confirm before acting,
+  // require continuous HIGH before believing the release - and `armed` already
+  // tracks precisely that interval, because rearming and releasing are the
+  // same question. A separate hold debounce would be the second divergent
+  // implementation in the trigger path that this header exists to prevent; it
+  // is also where a shorter release window would quietly make the effect
+  // stutter on contact bounce while the pads kept working.
+  bool held() const { return !armed; }
 };

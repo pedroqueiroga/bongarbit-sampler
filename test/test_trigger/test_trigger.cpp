@@ -299,6 +299,62 @@ void test_zero_confirm_window_still_requires_two_polls(void) {
 }
 
 // =========================================================================
+// 5b. held(): the same state read as a level
+// =========================================================================
+
+// GPIO7 holds the pitch shifter on rather than striking a sample, and reads
+// held() instead of update()'s edge. It must be the SAME machine - a separate
+// hold debounce is the second divergent implementation in the trigger path
+// that this header exists to prevent - so what gets pinned here is that
+// held() tracks exactly the interval between a confirmed strike and a believed
+// release, with both of the shipped windows intact.
+void test_held_is_true_from_the_confirmed_strike_to_the_believed_release(void) {
+    TriggerInput t;
+    t.confirm_us = 200; t.release_ms = 3;
+    const uint32_t edge = 1000000;
+
+    TEST_ASSERT_FALSE_MESSAGE(t.held(), "idle must not read as held");
+
+    // A LOW shorter than the confirm window is a glitch and must not engage.
+    t.update(edge, true);
+    TEST_ASSERT_FALSE_MESSAGE(t.held(),
+        "held() went true before the confirm window - the effect would engage "
+        "on the same glitches the confirm window exists to reject");
+
+    TEST_ASSERT_TRUE(t.update(edge + 200, true));
+    TEST_ASSERT_TRUE_MESSAGE(t.held(), "held() must be true from the strike");
+
+    // Contact bounce during the hold: a momentary HIGH must not release.
+    t.update(edge + 1000, false);
+    t.update(edge + 1200, true);
+    TEST_ASSERT_TRUE_MESSAGE(t.held(),
+        "a bounce back LOW restarted the release window, so held() must stay "
+        "true - otherwise the effect stutters on every press");
+
+    // Continuous HIGH, but not yet long enough.
+    t.update(edge + 2000, false);
+    t.update(edge + 2000 + 2500, false);
+    TEST_ASSERT_TRUE_MESSAGE(t.held(), "released before release_ms elapsed");
+
+    t.update(edge + 2000 + 3000, false);
+    TEST_ASSERT_FALSE_MESSAGE(t.held(), "held() must clear once the release is believed");
+}
+
+// held() is derived from the state update() maintains, so it only moves when
+// update() is called. Worth pinning because the failure is silent: a loop()
+// that stops polling this pin leaves the effect latched in whatever state it
+// was in, with no error anywhere.
+void test_held_does_not_change_without_polling(void) {
+    TriggerInput t;
+    t.confirm_us = 200; t.release_ms = 3;
+    t.update(1000, true);
+    TEST_ASSERT_TRUE(t.update(1200, true));
+    TEST_ASSERT_TRUE(t.held());
+    // Time passes with the button released, but nobody asks.
+    TEST_ASSERT_TRUE_MESSAGE(t.held(), "held() changed with no call to update()");
+}
+
+// =========================================================================
 // 6. micros() wraparound
 // =========================================================================
 
@@ -430,6 +486,9 @@ int main(int, char**) {
     // 5. internal contracts
     RUN_TEST(test_pendingSince_survives_the_strike_for_the_latency_probe);
     RUN_TEST(test_zero_confirm_window_still_requires_two_polls);
+
+    RUN_TEST(test_held_is_true_from_the_confirmed_strike_to_the_believed_release);
+    RUN_TEST(test_held_does_not_change_without_polling);
 
     // 6. wraparound
     RUN_TEST(test_behaviour_is_identical_across_micros_wraparound);

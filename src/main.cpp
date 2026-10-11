@@ -1,9 +1,16 @@
 /*
  * bongarbit-sampler
  *
- * One-shot sample triggers via 4 buttons (GPIO4/5/6/7), each playing a
- * sample out to a PCM5102A I2S DAC via the M16 library. Pressing a button
- * again while its sample is playing restarts it from the beginning.
+ * One-shot sample triggers on GPIO4/5/6, plus a held-button pitch shifter on
+ * GPIO7, out to a PCM5102A I2S DAC via the M16 library. Pressing a sample
+ * button again while its sample is playing restarts it from the beginning.
+ *
+ * GPIO7 used to be a fourth pad. It now shifts the whole mix down an octave
+ * for as long as it is held and triggers nothing - the effect replaced the
+ * pad. It is also the first processor in a chain meant to grow: the audio
+ * engine renders blocks of normalised float (src/audio_block.h) specifically
+ * so that a live audio-in stream can be read in at the top of audioUpdate()
+ * later without the DSP below it changing.
  *
  * Hardware: ESP32-S3 N16R8 + PCM5102A (I2S) + microSD (SPI, optional - see
  * USE_SD_SAMPLER below). Full wiring plan: docs/circuit.md
@@ -15,12 +22,14 @@
  *    files into RAM (M16's Wav::load() tries PSRAM first, so on this N16R8
  *    board samples land in the 8MB PSRAM). SD is only touched once at
  *    startup, not during playback - the card can be removed after boot.
- *    GPIO4 plays FILE_INDEX (whichever file the card lists first); GPIO5/6/7
- *    play 1.wav/2.wav/3.wav by name.
+ *    GPIO4 plays FILE_INDEX (whichever file the card lists first); GPIO5/6
+ *    play 1.wav/2.wav by name. 3.wav is no longer loaded - GPIO7 is the
+ *    effect pin now.
  *  - USE_SD_SAMPLER=0: GPIO4 plays a sample embedded directly in flash
  *    (src/kick_normalizado_data.h, generated from src/kick_normalizado.wav via
- *    tools/wav_to_header.py) - no SD card needed at all. GPIO5/6/7 pads are
- *    not available in this mode.
+ *    tools/wav_to_header.py) - no SD card needed at all. The GPIO5/6 pads are
+ *    not available in this mode; GPIO7's pitch shifter still is, because it
+ *    processes the mix rather than a sample of its own.
  */
 
 // --- Audio output latency (MUST be set before including M16.h) ---
@@ -202,17 +211,20 @@ float masterGain = 1.0f;
 SdFs sd;
 Wav  wav;
 
-// --- Extra pads: 1.wav / 2.wav / 3.wav on the SD card root ---
-#define PAD_COUNT 3
-const uint8_t   padPins[PAD_COUNT]  = {5, 6, 7};
-const char*     padFiles[PAD_COUNT] = {"/1.wav", "/2.wav", "/3.wav"};
+// --- Extra pads: 1.wav / 2.wav on the SD card root ---
+// Two, not three: GPIO7 stopped being a pad and became the pitch shifter's
+// hold control (see FX_PIN below). /3.wav is no longer loaded, and the card
+// does not need to carry it.
+#define PAD_COUNT 2
+const uint8_t   padPins[PAD_COUNT]  = {5, 6};
+const char*     padFiles[PAD_COUNT] = {"/1.wav", "/2.wav"};
 Wav             padWav[PAD_COUNT];
 Samp            padSamp[PAD_COUNT];
-uint8_t         padChannels[PAD_COUNT] = {1, 1, 1};
+uint8_t         padChannels[PAD_COUNT] = {1, 1};
 TriggerInput    padInput[PAD_COUNT];
 #if MIXER_GAIN_STAGING
 // Per-pad level, 1.0 = unity. Balance the kit here.
-float           padGain[PAD_COUNT] = {1.0f, 1.0f, 1.0f};
+float           padGain[PAD_COUNT] = {1.0f, 1.0f};
 #endif
 #endif
 
@@ -301,6 +313,30 @@ float           padGain[PAD_COUNT] = {1.0f, 1.0f, 1.0f};
 #define TRIGGER_PIN 4
 TriggerInput trigInput;
 
+// --- GPIO7: hold to pitch-shift (see src/pitch_shift.h) ---
+// This pin used to trigger /3.wav. It now runs the pitch shifter on the whole
+// mix for as long as it is held, and triggers nothing - the effect replaced
+// the pad rather than being added next to it.
+//
+// A hold, not a strike, so it reads TriggerInput::held() instead of the fire
+// edge from update(). Same state machine and the same two windows as every
+// other button: confirm for 200us before engaging, require 3ms of continuous
+// HIGH before believing the release. A second debounce for the hold case is
+// exactly what trigger_input.h exists to prevent.
+//
+// The shift itself: negative is down. -12 is an octave down, which on
+// percussion is the obviously useful direction and the easiest to confirm by
+// ear. Change the one number; pitchRatioFromSemitones() handles the rest, and
+// the ratio can be moved at runtime without a discontinuity if this ever grows
+// a knob.
+#define FX_PIN 7
+#ifndef PITCH_SHIFT_SEMITONES
+  #define PITCH_SHIFT_SEMITONES (-12.0f)
+#endif
+#include "pitch_shift.h"
+TriggerInput fxInput;
+PitchShift   pitchShift;
+
 Samp    samp;
 uint8_t sampleChannels = 1; // set at boot from whichever source is used below
 
@@ -327,6 +363,13 @@ void setup() {
   }
 
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
+  pinMode(FX_PIN, INPUT_PULLUP);
+
+  // Must happen before audioStart(), so the audio task never reads
+  // uninitialised history. Its diagnostic line is further down, with the rest
+  // of the audio summary.
+  pitchShift.init();
+  pitchShift.setRatio(pitchRatioFromSemitones(PITCH_SHIFT_SEMITONES));
 
 #if USE_SD_SAMPLER
   // initSD() already lists the .wav files it finds on the card (Serial).
@@ -383,12 +426,16 @@ void setup() {
       (unsigned long)(1000ULL * KICK_NORMALIZADO_FRAME_COUNT / KICK_NORMALIZADO_SAMPLE_RATE));
 #endif
 
-  // DOUT is GPIO8, not M16's default GPIO18. On this board GPIO18 does not
-  // drive: with the data wire on 18 the DAC's DIN sits at 0V through an entire
-  // sample, while BCK/WS on 16/17 read the expected ~1.6V average. Moving the
-  // same wire to 16 or 17 puts 1.6V on DIN and makes the DAC audibly convert
-  // the clock as garbage - so the wire, the DAC and the whole analog path are
-  // fine and the pin is not. Not diagnosed further; GPIO8 is free here.
+  // BCK/WS/DOUT = 16/17/18, which is M16's own default set. Stated explicitly
+  // anyway, for the din argument below.
+  //
+  // This comment used to claim GPIO18 "does not drive" and that DOUT had to be
+  // moved to GPIO8, on the evidence of 0V measured at the DAC's DIN. That was
+  // wrong: the 0V was an intermittent breadboard contact, and the pad has
+  // worked on 18 ever since the connections were soldered directly. Recorded
+  // rather than deleted because the measurement really was 0V - a dead pin and
+  // a bad contact look identical from one multimeter reading, and this cost a
+  // bench session. See docs/bancada.md.
   //
   // din = -1 also disables the I2S RX channel. M16's default set is
   // {16, 17, 18, 21}, and any din other than -1 makes audioStart() allocate an
@@ -413,15 +460,29 @@ void setup() {
   DBG("DAC: PCM5102A has no status feedback pin - the 'M16 is running' line "
       "above is the only software confirmation; audible output still "
       "depends on correct wiring (docs/circuit.md)\n");
+  DBG("ENGINE: %d-frame float blocks (%.2f ms), ring %d x %d (%.2f ms)\n",
+      AUDIO_BLOCK_FRAMES, (double)(1000.0f * AUDIO_BLOCK_FRAMES / SAMPLE_RATE),
+      DMA_BUFFERS, DMA_BUFFER_LENGTH,
+      (double)(1000.0f * DMA_BUFFERS * DMA_BUFFER_LENGTH / SAMPLE_RATE));
+  DBG("FX: hold GPIO%d to pitch shift %+.1f semitones (ratio %.4f); adds "
+      "%.1f ms when engaged, bit-exact bypass when not\n",
+      FX_PIN, (double)PITCH_SHIFT_SEMITONES, (double)pitchShift.getRatio(),
+      (double)(1000.0f * PitchShift::latencyFrames() / SAMPLE_RATE));
 #if LATENCY_PROBE
   probeCalibrate(); // after audioStart(), while nothing is playing
 #endif
-  Serial.println("Ready. Press the trigger button to play the sample.");
+#if USE_SD_SAMPLER
+  Serial.printf("Ready. GPIO%d/%d/%d trigger samples; hold GPIO%d to pitch "
+                "shift the mix.\n", TRIGGER_PIN, padPins[0], padPins[1], FX_PIN);
+#else
+  Serial.printf("Ready. GPIO%d triggers the flash sample; hold GPIO%d to pitch "
+                "shift the mix.\n", TRIGGER_PIN, FX_PIN);
+#endif
 }
 
 void loop() {
-  // One timestamp for the whole sweep, so all four inputs are conditioned
-  // against the same instant. Nothing blocking belongs in this function: with
+  // One timestamp for the whole sweep, so every input is conditioned against
+  // the same instant. Nothing blocking belongs in this function: with
   // DEBUG_TRIGGERS off it is four digitalRead()s and some arithmetic, which
   // keeps the poll period in the low tens of microseconds.
   uint32_t now_us = micros();
@@ -445,6 +506,16 @@ void loop() {
     }
   }
 #endif
+
+  // The effect pin runs the same machine as every other button, but its return
+  // value is discarded: what matters here is held(), the level, not the strike
+  // edge. update() still has to be called every poll - held() is derived from
+  // the state update() maintains, so skipping a poll freezes the control.
+  //
+  // setEngaged() only records a request; the audio task picks it up at its
+  // next block boundary. Nothing blocking or audio-rate happens in loop().
+  fxInput.update(now_us, digitalRead(FX_PIN) == LOW);
+  pitchShift.setEngaged(fxInput.held());
 
 #if LATENCY_PROBE
   probePoll();
@@ -496,11 +567,18 @@ void audioUpdate() {
   }
 #endif
 
-  // --- Processing chain goes here ---------------------------------------
+  // --- Processing chain --------------------------------------------------
   // Every processor has the shape process(AudioBlock&): it sees a whole block
   // of normalised float and may keep history across calls. This is the window
   // the block engine exists to provide, and the slot a live audio-in stream
   // will eventually be read into at the top of rather than bolted onto.
+  //
+  // The shifter runs unconditionally, and that is on purpose: it needs to keep
+  // writing its delay line even while disengaged, or pressing the button would
+  // start the effect from silence. While bypassed it costs 32 stores per
+  // channel and returns the block bit-exact - pinned by
+  // test_bypass_is_bit_exact, which is what makes leaving it here free.
+  pitchShift.process(blk);
 
   // Master level, limiter, and the one conversion back to the wire's units.
   //
