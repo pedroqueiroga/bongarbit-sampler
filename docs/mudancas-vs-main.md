@@ -435,18 +435,21 @@ Os ambientes do PlatformIO compartilham `src/` e são separados por
 | Polifonia (soma de vozes) | hardware |
 | Transporte I2S: CPU, jitter, underrun | banco v2 em hardware, 9 profundidades |
 | Motor de blocos em float | 16 testes no host + **ouvido na placa** em 11/10/2026 |
-| Pitch shifter | 13 testes no host (DFT confirma a octava) + **ouvido na placa**, 11/10/2026 |
-| Ring de DMA de 5,8 ms | ouvido com 1–3 vozes nesta versão da M16; **rolo de 4 vozes não refeito** |
-| Mixer: joelho suave em colisão | 18 testes no host; **não provocado em hardware** (precisa de vozes somando acima do joelho) |
-| Latência ponta a ponta | **não medida** — fase F pendente |
+| Pitch shifter | 13 testes no host (DFT confirma a octava) + **ouvido na placa** com material real |
+| Mixer: joelho suave em colisão | 18 testes no host + **ouvido na placa**: 3 vozes a ~−3 dBFS, soma ~267% do fundo de escala |
+| Ring de DMA de 5,8 ms | limpo com 3 vozes nesta versão da M16 |
+| Conector USB | **não explicado** — áudio confiável no COM, não no nativo |
+| Latência ponta a ponta | **não medida** — fase F, bloqueada até o conector estar entendido |
 | Filtro RC | **não montado** — só simulado |
 | Rejeição de batida fantasma | **não testada** em hardware |
 
-O que sobrou de ouvido, e é específico:
+Duas ressalvas que valem mais que a tabela:
 
-1. **Rolo de quatro vozes** — fecha de uma vez a reconfirmação dos 5,8 ms *e* o
-   joelho suave, porque é a única condição em que as vozes somam acima do
-   joelho. Hoje os samples estão a ~−16 dB (as cópias atenuadas da escada de
-   DMA), então pode ser preciso subir o `masterGain` para provocar a colisão.
-2. **No pitch shifter:** um clique ao engatar ou soltar (seria a rampa dry/wet
-   falhando) e o *warble* de ~43 Hz, que é esperado e não defeito.
+1. **Todo resultado anterior de "não clipa" foi obtido com material que não
+   tinha como clipar** — as cópias da escada de DMA somavam ~67% do fundo de
+   escala com três vozes. Só em 11/10/2026, com os samples reais (vários a
+   0,0 dBFS), o joelho foi exercitado de verdade. E aí sim está confirmado.
+2. **O teste de quatro vozes não existe mais neste firmware.** O GPIO7 virou o
+   efeito, então o máximo é GPIO4+5+6. Três vozes acima do joelho testam o
+   limitador com folga, mas a escada de DMA de agosto foi medida *com quatro* e
+   não tem como ser reproduzida sem devolver o pad.

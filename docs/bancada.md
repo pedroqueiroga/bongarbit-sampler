@@ -1038,3 +1038,47 @@ resultados de 11/10/2026 (motor de blocos e pitch shifter ouvidos) valem — mas
 valem *com* essa anotação, e as medições de latência da fase F não podem ser
 feitas antes disso estar entendido, porque alimentação marginal e latência não
 se separam depois.
+
+### Com os samples reais: joelho suave confirmado — 11/10/2026
+
+As cópias de −12 dB saíram da raiz do cartão (foram para `samples-12db/`, não
+apagadas — são o setup da escada de DMA) e o material real do Pedro voltou.
+
+Isso muda a condição de teste de forma importante:
+
+| | Cópias da escada | Samples reais |
+|---|---|---|
+| Pico | −13 dBFS, quatro arquivos idênticos | −3,5 / −3,6 / −2,8 dBFS, vários a 0,0 |
+| Formato | 16 bit / 44,1 kHz | **8 bit / 11,025 kHz** |
+| Soma de 3 vozes | ~67% do fundo de escala — **nunca alcança o joelho** | ~267% — **bem acima** |
+
+Ou seja: todos os resultados anteriores de "não clipa" foram obtidos com
+material que não tinha como clipar. Esta é a primeira vez que o joelho suave
+foi exercitado de verdade.
+
+**Resultado: som e efeito ótimos com três vozes.** O joelho está fazendo o
+trabalho — com o clamp duro, três vozes a ~0 dBFS seriam achatamento audível em
+cada sobreposição, que é exatamente o clique que originou o `mixer.h`.
+
+Duas observações honestas sobre o que isso ensina:
+
+- **O piso de 8 bits não incomodou.** Ele é real (~48 dB de quantização) e está
+  documentado como um dos dois confounds de agosto. Mas com este material ele
+  não se manifestou como problema. Isso sugere que, dos dois confounds, o
+  **clipping** era o que realmente dominava o "encraquelado" — o piso de 8 bits
+  era aritmética correta com peso menor do que eu atribuí.
+- **"Quatro vozes" saiu de pauta.** O GPIO7 virou o efeito, então o máximo
+  neste firmware é GPIO4+5+6. Três vozes a ~0 dBFS já passam de 267% do fundo
+  de escala, então testam o joelho com folga; mas a escada de DMA de agosto
+  (medida *com quatro*) não tem como ser reproduzida sem devolver o pad.
+
+#### Estado de ouvido ao fim de 11/10/2026
+
+| Item | Estado |
+|---|---|
+| Motor de blocos em float | **ouvido, limpo** — confirma a previsão de 1 LSB: trocar ponto fixo por float não mudou o som |
+| Pitch shifter | **ouvido, funcionando** com material real |
+| Joelho suave em colisão | **ouvido, limpo** com 3 vozes acima do joelho |
+| Ring de 5,8 ms | limpo com 3 vozes nesta versão da M16; o teste de 4 vozes não é mais possível |
+| Conector USB | **não explicado** — áudio confiável no COM, não no nativo |
+| Latência absoluta (fase F) | **não medida**, e bloqueada até o conector estar entendido |
