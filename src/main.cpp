@@ -129,46 +129,64 @@ static_assert(DMA_BUFFERS * DMA_BUFFER_LENGTH <= 512,
 // override above.
 #include "trigger_input.h"
 
-// --- Mixer gain staging and output limiting (see src/mixer.h) ---
+// --- The audio engine: block-based, float (see src/audio_block.h) ---
+// audioUpdate() renders AUDIO_BLOCK_FRAMES frames per call into a normalised
+// float block, instead of returning one frame at a time. The three reasons -
+// driver calls, PSRAM locality, and the fact that DSP with memory needs a
+// window - are documented in that header. The third is the one that forced it.
+#include "audio_block.h"
+
+// Rendering one block must not take a meaningful bite out of the ring that is
+// draining while we render it. A quarter of the ring is the bound: it leaves
+// three block periods of slack for the worst-case render, which at four voices
+// measured ~3,500 cycles against a 174,000-cycle block period. Both constants
+// are only visible together here, which is why the assert lives in main.cpp.
+static_assert(AUDIO_BLOCK_FRAMES * 4 <= DMA_BUFFERS * DMA_BUFFER_LENGTH,
+              "audio block is more than a quarter of the DMA ring - either "
+              "shrink AUDIO_BLOCK_FRAMES or deepen the ring");
+
+// --- Mixer gain staging and output limiting ---
 // Two independent switches, both on, both reversible, because they change how
 // the instrument sounds and that is not a decision to make silently.
 //
-// MIXER_GAIN_STAGING gives every voice its own Q8 level plus a master level -
-// the MPC model. It defaults to unity everywhere, so turning it on changes
-// nothing audible until a kit is actually dialled in; it exists so that the
-// control is there at all. Deliberately NOT a divide-by-voice-count, which
-// would cost 12dB on one voice to protect a worst case that rarely happens.
+// MIXER_GAIN_STAGING gives every voice its own level plus a master level - the
+// MPC model. It defaults to unity everywhere, so turning it on changes nothing
+// audible until a kit is actually dialled in; it exists so that the control is
+// there at all. Deliberately NOT a divide-by-voice-count, which would cost
+// 12dB on one voice to protect a worst case that rarely happens.
 //
 // MIXER_SOFT_CLIP replaces the hard clamp with a knee that is the identity
 // below 75% of full scale and asymptotic to full scale above it. This is the
 // part that removes the clicks: with a normalised kit, two voices sum past
 // full scale and hard-clamping a transient is what produced them.
 //
-// Set MIXER_SOFT_CLIP to 0 to get the previous hard clamp back for comparison.
+// Set MIXER_SOFT_CLIP to 0 to get the hard clamp back for comparison. That
+// needs no replacement curve: audioToI16() clamps on the way out regardless,
+// because an out-of-range float cannot be converted to int safely, so turning
+// the knee off leaves exactly the clamp that was there before it existed.
 #define MIXER_GAIN_STAGING 1
 #define MIXER_SOFT_CLIP    1
 
-#include "mixer.h"
-
 #if MIXER_GAIN_STAGING
-  #define MIXGAIN(s, g) mixApplyGain((s), (g))
+  #define MIXGAIN(x, g) ((x) * (g))
 #else
-  #define MIXGAIN(s, g) ((int32_t)(s))
+  #define MIXGAIN(x, g) (x)
 #endif
 
 #if MIXER_SOFT_CLIP
-  #define MIXCLIP(x) mixSoftClip(x)
+  #define MIXCLIP(x) audioSoftClip(x)
 #else
-  #define MIXCLIP(x) mixHardClip(x)
+  #define MIXCLIP(x) (x)
 #endif
 
 #if MIXER_GAIN_STAGING
-// Per-voice and master levels, Q8 (MIX_GAIN_UNITY = 256 = unity). These are
-// the knobs a kit is balanced with: lower a loud sample here rather than
-// re-normalising the .wav. Unity by default - the headroom convention is that
-// kit material carries ~6dB of its own, same as on an MPC.
-int32_t trigGain   = MIX_GAIN_UNITY;
-int32_t masterGain = MIX_GAIN_UNITY;
+// Per-voice and master levels, now plain float with 1.0 = unity (they were Q8
+// fixed point before the engine moved to float). These are the knobs a kit is
+// balanced with: lower a loud sample here rather than re-normalising the .wav.
+// Unity by default - the headroom convention is that kit material carries
+// ~6dB of its own, same as on an MPC.
+float trigGain   = 1.0f;
+float masterGain = 1.0f;
 #endif
 
 #if USE_SD_SAMPLER
@@ -193,8 +211,8 @@ Samp            padSamp[PAD_COUNT];
 uint8_t         padChannels[PAD_COUNT] = {1, 1, 1};
 TriggerInput    padInput[PAD_COUNT];
 #if MIXER_GAIN_STAGING
-// Per-pad level, Q8. Balance the kit here.
-int32_t         padGain[PAD_COUNT] = {MIX_GAIN_UNITY, MIX_GAIN_UNITY, MIX_GAIN_UNITY};
+// Per-pad level, 1.0 = unity. Balance the kit here.
+float           padGain[PAD_COUNT] = {1.0f, 1.0f, 1.0f};
 #endif
 #endif
 
@@ -378,6 +396,18 @@ void setup() {
   // This project has no I2S input (docs/circuit.md lists GPIO21 as unused).
   seti2sPins(16, 17, 18, -1);
 
+  // One audio task, stated rather than inherited.
+  //
+  // This is M16's current default on ESP32, but it is a default, and it is the
+  // one default whose flipping would break this firmware in two ways at once:
+  // audioUpdate() would run on both cores against a single static block
+  // buffer, and M16's block-split finaliser interleaves two per-core
+  // partitions that this engine does not produce. Dual-core rendering here
+  // would mean partitioning voices with audioPartitionOffset()/Stride(), which
+  // is a real option for later - four voices is not why this board is busy -
+  // but it is a design, not a flag.
+  setIsDualCore(false);
+
   audioStart();
   DBG("DAC: I2S started - BCK=GPIO16 WS=GPIO17 DOUT=GPIO18, RX disabled\n");
   DBG("DAC: PCM5102A has no status feedback pin - the 'M16 is running' line "
@@ -421,40 +451,65 @@ void loop() {
 #endif
 }
 
-void audioUpdate() {
-  int16_t L, R;
-  if (sampleChannels == 2) {
-    samp.nextStereo(L, R);
-  } else {
-    L = R = samp.next(); // nextStereo() only works for stereo buffers (num_channels==2)
-  }
-  int32_t mixL = MIXGAIN(L, trigGain), mixR = MIXGAIN(R, trigGain);
-
-#if USE_SD_SAMPLER
-  // Pads can play concurrently with the main button and with each other -
-  // sum all voices and clip, instead of just outputting the last one.
-  for (uint8_t i = 0; i < PAD_COUNT; i++) {
-    int16_t pl, pr;
-    if (padChannels[i] == 2) {
-      padSamp[i].nextStereo(pl, pr);
+// Add one voice's next AUDIO_BLOCK_FRAMES frames into the block.
+//
+// Voice-outer, frame-inner, and that order is the point: each voice walks 32
+// consecutive frames of its own PSRAM buffer before the next voice starts.
+// The old frame-outer loop interleaved four PSRAM streams and bounced the
+// cache between them on every single frame.
+//
+// Skipping a silent voice saves the whole inner loop, which is most of them
+// most of the time. Samp::next() already returns 0 when stopped, so the check
+// is an optimisation and not a behaviour change - and the race it has with
+// start() in loop() can only cost one block, which is a granularity the
+// trigger path already has.
+static inline void addVoice(AudioBlock& b, Samp& voice, uint8_t channels, float gain) {
+  if (!voice.isPlaying()) return;
+  for (int n = 0; n < AUDIO_BLOCK_FRAMES; n++) {
+    int16_t l, r;
+    if (channels == 2) {
+      voice.nextStereo(l, r);
     } else {
-      pl = pr = padSamp[i].next();
+      l = r = voice.next(); // nextStereo() only works for stereo buffers (num_channels==2)
     }
-    mixL += MIXGAIN(pl, padGain[i]);
-    mixR += MIXGAIN(pr, padGain[i]);
+    b.l[n] += MIXGAIN(audioFromI16(l), gain);
+    b.r[n] += MIXGAIN(audioFromI16(r), gain);
+  }
+}
+
+void audioUpdate() {
+  // One block, reused. Static rather than stack-local so there is exactly one,
+  // which is only safe because there is exactly one audio task - see the
+  // setIsDualCore(false) call in setup(). If that ever becomes two, this
+  // buffer is the first thing that breaks, silently.
+  static AudioBlock blk;
+
+  audioBlockSilence(blk);
+
+  // Voices accumulate. Pads play concurrently with the main button and with
+  // each other, so this sums them all rather than outputting the last one
+  // triggered.
+  addVoice(blk, samp, sampleChannels, trigGain);
+#if USE_SD_SAMPLER
+  for (uint8_t i = 0; i < PAD_COUNT; i++) {
+    addVoice(blk, padSamp[i], padChannels[i], padGain[i]);
   }
 #endif
 
-#if MIXER_GAIN_STAGING
-  mixL = mixApplyGain(mixL, masterGain);
-  mixR = mixApplyGain(mixR, masterGain);
-#endif
+  // --- Processing chain goes here ---------------------------------------
+  // Every processor has the shape process(AudioBlock&): it sees a whole block
+  // of normalised float and may keep history across calls. This is the window
+  // the block engine exists to provide, and the slot a live audio-in stream
+  // will eventually be read into at the top of rather than bolted onto.
 
-  // audioBlockWrite(), not the older i2s_write_samples(), which is now a
-  // [[deprecated]] shim over it AND returns false without writing anything if
-  // M16's dual-core block-split mode is ever active. It clips to 16 bits
-  // itself, which is a no-op here: MIXCLIP already guarantees the range, and
-  // doing it in mixer.h is what lets the soft knee be the thing that shapes a
-  // peak collision rather than a hard clamp.
-  audioBlockWrite(MIXCLIP(mixL), MIXCLIP(mixR));
+  // Master level, limiter, and the one conversion back to the wire's units.
+  //
+  // audioBlockWrite(), not the older i2s_write_samples(): that is now a
+  // [[deprecated]] shim over it which also returns false without writing
+  // anything if M16's dual-core block-split mode is ever active. It clips to
+  // 16 bits itself, which is a no-op after audioToI16().
+  for (int n = 0; n < AUDIO_BLOCK_FRAMES; n++) {
+    audioBlockWrite(audioToI16(MIXCLIP(MIXGAIN(blk.l[n], masterGain))),
+                    audioToI16(MIXCLIP(MIXGAIN(blk.r[n], masterGain))));
+  }
 }
