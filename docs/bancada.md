@@ -806,3 +806,98 @@ pedirem os 2 ms de volta.
 - Latência absoluta continua não medida: falta a fase F. O filtro do DAC
   (~0,50 ms, `FLT` em GND) é constante e cancela nas comparações acima, mas
   entra em qualquer número absoluto.
+
+---
+
+## 10. Correção à seção 9: a M16 já fazia escrita por bloco — 11/10/2026
+
+A seção 9 mediu três modelos de alimentação do I2S e recomendou **task com
+escrita por bloco**, pela diferença de ~19% de um núcleo contra a escrita por
+frame. A recomendação continua certa. A premissa, não: a linha
+`task, 1 frame (M16)` modelava uma M16 que já não existia quando o firmware
+foi gravado.
+
+### O que foi encontrado
+
+Ao começar a trocar a alimentação do firmware, lendo a M16 instalada:
+
+- `i2s_write_samples()` é hoje um shim **`[[deprecated]]`** sobre
+  `audioBlockWrite()`.
+- `audioBlockWrite()` acumula `M16_BLOCK_SIZE` (32) frames num buffer e faz
+  **uma** chamada `i2s_channel_write()` por bloco.
+- O firmware chamava o shim. O compilador vinha avisando; o aviso estava
+  perdido no meio dos avisos internos da própria M16.
+
+Ou seja: o ganho de CPU que a seção 9 recomendou perseguir **já estava no
+bolso**, entregue pela biblioteca, sem mudança de código nossa.
+
+A dependência era `https://github.com/algomusic/M16.git`, sem revisão.
+
+### Por que isso não é só uma curiosidade
+
+| Fato | Consequência |
+|---|---|
+| O checkout da M16 foi destruído e re-clonado em 10/10/2026 | O commit contra o qual a bancada de 13–14/08 rodou é **irrecuperável** (o clone tem uma única entrada de reflog) |
+| O transporte mudou entre aquele commit e este | A escada de DMA e o resultado de "4 vozes limpas em 5,8 ms" passam a **provisórios** |
+| O mesmo update trouxe um modo dual-core em que o shim retorna `false` e **não escreve nada** | Um default mudando lá em cima emudeceria a placa. O firmware agora declara `setIsDualCore(false)` em vez de herdar |
+
+A M16 está pinada no commit `aef89b2` desde então, pelo mesmo argumento que já
+valia para `platform`. **O pin não é tranquilizador — é honesto:** ele fixa uma
+versão que a placa nunca rodou nas sessões de 13–14/08. A diferença é que
+agora um resultado de hardware fica preso a alguma coisa.
+
+### Isso invalida os números da seção 9?
+
+Não. O banco (`src/test_i2s_bench.cpp`) não usa M16 — ele chama o driver do
+IDF direto. Os três modelos que ele mede são modelos *nossos*, e as medidas de
+CPU, jitter e underrun por profundidade de ring continuam valendo como
+caracterização do transporte I2S deste hardware.
+
+O que muda é a leitura de **uma** linha: `task, 1 frame (M16)` deve ser lida
+como "escrita por frame no driver", um modelo genérico, e **não** como "o que a
+M16 faz". A M16 está no grupo `task, block`.
+
+E muda a conclusão prática: a troca do firmware para blocos deixou de ser
+justificada por CPU. Foi feita por outros dois motivos, que seguem de pé:
+
+1. **Localidade de PSRAM** — renderizar voz-por-fora faz cada voz percorrer 32
+   frames contíguos do próprio buffer, em vez de intercalar quatro streams.
+   O agrupamento da M16 não faz nada por isso.
+2. **Janela para DSP** — e este é o que forçou. A M16 guarda a *nossa saída*,
+   depois de já termos tido que decidir qual é. Um pitch shifter precisa de uma
+   janela de *entrada*. Nenhum agrupamento na biblioteca cria isso.
+
+### Estado do firmware depois disso
+
+Gravado e confirmado por log em 11/10/2026:
+
+```
+M16 is running (single-core audio task mode)
+ENGINE: 32-frame float blocks (0.73 ms), ring 4 x 64 (5.80 ms)
+FX: hold GPIO7 to pitch shift -12.0 semitones (ratio 0.5000); adds 11.6 ms
+    when engaged, bit-exact bypass when not
+Ready. GPIO4/5/6 trigger samples; hold GPIO7 to pitch shift the mix.
+```
+
+Boot limpo, PSRAM 8189 KB, três samples carregados, sem watchdog ao longo da
+janela de captura. 71 testes no host passando.
+
+### O que a próxima sessão precisa responder, de ouvido
+
+Nada disso foi julgado por ouvido ainda, e três das quatro perguntas são de
+ouvido mesmo:
+
+1. **O motor de blocos soa idêntico ao anterior?** Deve soar. É o que o teste
+   `test_float_knee_matches_the_integer_reference` prevê (1 LSB em toda a
+   faixa). Se **não** soar idêntico, o teste está medindo a coisa errada e é
+   mais importante que a diferença audível.
+2. **Os 5,8 ms continuam limpos** com 4 vozes nesta versão da M16? Rajadas
+   drenam um ring mais rápido, não mais devagar, então a expectativa é sim.
+3. **O joelho suave num rolo de quatro vozes** — pergunta acumulada desde o
+   commit do mixer.
+4. **O pitch shifter.** O que ouvir, especificamente: um clique ao engatar ou
+   soltar (seria a rampa dry/wet falhando), e o *warble* de ~43 Hz, que é
+   esperado e não um defeito.
+
+Fase F (latência absoluta) continua pendente e agora tem um componente novo a
+separar: os ~11,6 ms do shifter só existem com o efeito engatado.

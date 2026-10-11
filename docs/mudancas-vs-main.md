@@ -19,6 +19,9 @@ Resumo das áreas, cada uma justificada abaixo:
 | 9 | Diagnóstico | Probe de latência; sketch de tom I2S | Medir em vez de estimar |
 | 10 | Docs | `circuit-rc.md`, `bancada.md`, `CLAUDE.md` | Registrar decisões e medições |
 | 11 | Mixer | Ganho por voz, master e joelho suave | Kit normalizado clipava com 2 pads |
+| 12 | Build | M16 pinado num commit exato | A biblioteca reescreveu o transporte de áudio sob o projeto |
+| 13 | Motor | `audioUpdate()` renderiza blocos em float | Sem bloco não existe janela para DSP com memória |
+| 14 | Efeito | Pitch shift no GPIO7 enquanto pressionado | Primeiro processador de stream; GPIO7 deixa de ser pad |
 
 ---
 
@@ -259,22 +262,166 @@ joelho soa bem num rolo de quatro vozes é questão de bancada.
 
 ---
 
+## 12. M16 pinada num commit exato
+
+Até 11/10/2026 a dependência era `https://github.com/algomusic/M16.git`, sem
+revisão. Isso não é um risco hipotético: **a biblioteca reescreveu o transporte
+de áudio enquanto o projeto era construído em cima dela.**
+
+`i2s_write_samples()` fazia uma chamada `i2s_channel_write()` por frame. Hoje é
+um shim `[[deprecated]]` sobre `audioBlockWrite()`, que acumula 32 frames e faz
+uma escrita de DMA por bloco. Mesma chamada no nosso código, mesmo som — e
+~19% de um núcleo de diferença, que é exatamente a grandeza que a seção 9 da
+[bancada.md](bancada.md) passou uma sessão medindo.
+
+A mesma atualização acrescentou um modo dual-core *block-split* em que o shim
+**retorna `false` e não escreve nada**, alcançável se um default lá em cima
+mudar (`setIsDualCore`, hoje `false` no ESP32).
+
+| Consequência | Detalhe |
+|---|---|
+| Medições expiram em silêncio | Toda nota "validado em hardware" em `docs/` ficava pendurada numa versão que podia trocar |
+| O firmware chamava função obsoleta | Agora chama `audioBlockWrite()` direto |
+| Um default poderia emudecer a placa | O firmware agora declara `setIsDualCore(false)` em vez de herdar |
+
+**O pin é honesto, não tranquilizador:** ele **não** é o commit contra o qual a
+bancada de 13–14/08 rodou. Aquele checkout foi destruído e re-clonado em
+10/10/2026 e o commit é irrecuperável (o clone tem uma única entrada de
+reflog). Por isso a escada de DMA e o resultado de quatro vozes estão marcados
+como **provisórios** até serem reconfirmados nesta versão.
+
+O `CLAUDE.md` já fazia esse argumento para `platform`. A biblioteca de áudio
+tem pelo menos o mesmo direito a ele — e agora tem a evidência.
+
+---
+
+## 13. O motor de áudio: blocos em float
+
+`audioUpdate()` produzia um frame por chamada. Agora renderiza
+`AUDIO_BLOCK_FRAMES` (32 = 0,73 ms) de float normalizado (±1,0) num bloco e o
+drena no fim. Mesmas vozes, mesma mistura, mesma curva de limitador — o motor
+embaixo é que mudou.
+
+Três motivos, em ordem crescente de quanto realmente pesaram:
+
+| Motivo | Peso |
+|---|---|
+| Chamadas de driver (~1.126 ciclos/frame, ~19% de um núcleo) | **Nenhum.** A M16 já passou a agrupar 32 frames sozinha — este ganho já estava no bolso |
+| Localidade de PSRAM | **Real.** Voz-por-fora/frame-por-dentro faz cada voz percorrer 32 frames contíguos do próprio buffer, em vez de intercalar quatro streams de PSRAM e sacudir a cache a cada frame |
+| **Janela para DSP** | **Foi o que forçou a mudança.** Um pitch shifter precisa de uma janela de sinal, não de uma amostra |
+
+O terceiro é o que o agrupamento da M16 **não** resolve: ela guarda a *nossa
+saída*, depois de já termos tido que decidir qual é.
+
+Float porque ±1,0 é o que toda framework de áudio fala (Bela, JUCE, APIs de
+plugin, todo paper de DSP). Não é por precisão — ponto fixo de 16 bits dava
+conta de somar quatro vozes. É porque a próxima coisa a entrar aqui é um stream
+de áudio ao vivo, e uma cadeia em unidades convencionais aceita DSP de qualquer
+lugar sem reescalar. A FPU do S3 torna isso quase gratuito **numa task**, e
+indisponível **numa ISR** — que é o tradeoff registrado na seção 9 da bancada e
+a razão de o motor ser uma task.
+
+O `src/mixer.h` saiu do caminho de áudio e ficou como **referência**:
+`test_float_knee_matches_the_integer_reference` varre as duas curvas e exige
+concordância dentro de 1 LSB. A curva inteira é a que foi julgada de ouvido na
+placa, então esse teste é o que diz que esta mudança **não alterou o som** — e
+o que impede as duas de divergirem em silêncio. Não apagar como código morto.
+
+**Verificação:** 16 testes em `test/test_audio_block/`. Em hardware: boot
+limpo, `single-core audio task mode`, blocos de 32 frames confirmados no log,
+sem watchdog. **Não julgado de ouvido ainda.**
+
+---
+
+## 14. Pitch shift no GPIO7, como processador de stream
+
+Segura o GPIO7 e a mistura inteira cai uma octava; solta e volta. O GPIO7
+**deixa de ser pad** — o efeito substituiu o pad, não foi acrescentado ao lado.
+`/3.wav` não é mais carregado.
+
+**Escrito para um stream, não para o sampler.** Mudar o pitch de um sample
+guardado é trivial: o `Samp` já reamostra, então tocar o buffer mais rápido
+mudaria o tom — e encurtaria o som. Isto processa um sinal de que nunca viu o
+fim: lê um bloco, escreve um bloco, mantém o próprio histórico, e não sabe de
+onde o áudio veio. Quando o audio-in chegar, ele é lido no topo do
+`audioUpdate()` e o `pitch_shift.h` **não muda**.
+
+`test_block_size_does_not_change_the_output` é o que faz disso um fato e não uma
+esperança: o mesmo sinal em pedaços irregulares de 1, 7, 32, 3, 64, 13, 128 e 5
+frames tem que dar saída bit-idêntica a uma única chamada de 16384 frames. Se o
+tamanho do bloco do hospedeiro vazasse para o som, um callback de entrada de
+tamanho diferente não seria drop-in e a premissa estaria errada.
+
+**O algoritmo:** duas derivações (*taps*) janeladas numa linha de atraso, lidas
+a `ratio` enquanto a escrita corre a 1, com crossfade de **potência constante**
+para que o ganho de cada tap seja exatamente zero onde ela tem que pular.
+
+Os custos são inerentes a mudar pitch no domínio do tempo, não falhas de
+implementação, e documentados em vez de escondidos:
+
+| Artefato | Valor | Observação |
+|---|---|---|
+| Warble | ~43 Hz numa octava | Percussão mascara; nota tonal sustentada não |
+| Latência | ~11,6 ms | É a janela de reamostragem. `latencyFrames()` reporta em vez de deixar descobrir |
+
+Os dois escalam com `PITCH_BUF_FRAMES` em direções opostas — é o único botão
+real aqui.
+
+| Alternativa | Por que não |
+|---|---|
+| Phase vocoder (FFT) | Troca warble por borrão de transiente, precisa de janela **no mínimo tão longa** (logo não é mais rápido) e custa muito mais CPU. Para percussão é o tradeoff errado |
+| Interpolação cúbica nos taps | Fica abaixo do warble que o efeito já tem; se o shift precisar soar limpo em material tonal, aí o vocoder é a resposta melhor |
+| Tabela de janela em vez de `sinf()` | `sinf()` custa ~4% do orçamento do bloco. É a primeira coisa a fazer se isso precisar ficar mais barato, não antes |
+
+Três decisões que merecem nome:
+
+- **`held()` é um acessor novo no `TriggerInput`, não uma máquina nova.** Segurar
+  precisa exatamente do condicionamento que bater precisa, e `armed` já marca
+  justamente o intervalo entre um toque confirmado e um soltar acreditado. Um
+  debounce separado para o caso de segurar seria a segunda implementação
+  divergente no caminho de disparo que o `trigger_input.h` existe para evitar.
+- **`setEngaged()` só registra um pedido**; a task de áudio aplica na fronteira
+  do bloco. Agir direto poria o `loop()` escrevendo a fase do crossfade
+  enquanto a task de áudio a lê — uma corrida real entre núcleos, no único
+  estado sobre o qual o algoritmo todo é construído. Custa até 0,73 ms no
+  gesto, contra os 11,6 ms que o efeito já carrega.
+- **O processador roda sempre**, alimentando a linha de atraso mesmo
+  desengatado, senão apertar o botão começa o efeito a partir do silêncio. O
+  bypass é bit-exato, o que é o que torna gratuito deixá-lo no caminho.
+
+**Verificação:** 15 testes em `test/test_pitch_shift/`, incluindo medições por
+DFT de que a energia realmente vai para a octava acima e abaixo. Em hardware:
+log de boot confirma `ratio 0.5000` e 11,6 ms, estável sem watchdog. **Não
+julgado de ouvido ainda.**
+
+---
+
 ## Mapa do repositório
 
 ```
 src/main.cpp            o sampler (setup/loop/audioUpdate)
-src/trigger_input.h     TriggerInput — compilado no firmware E nos testes
-src/mixer.h             ganho por voz, master e joelho suave — idem
+src/trigger_input.h     TriggerInput: update() = batida, held() = segurar
+src/mixer.h             ganho e joelho em ponto fixo — REFERÊNCIA dos testes,
+                        já fora do caminho de áudio (não apagar)
+src/audio_block.h       AudioBlock, unidades float, conversões das pontas
+src/pitch_shift.h       PitchShift: dois taps janelados numa linha de atraso
 src/test_sd.cpp         diagnóstico de cartão com a SD.h do core (env sd_test)
 src/test_i2s_bench.cpp  banco de medição de I/O I2S, sem M16 (env i2s_bench)
 sim/trigger_model.h     gerador de traço, modelo RC, designs rejeitados
 sim/trigger_sim.cpp     CLI de varredura (--sweep=all)
-test/test_trigger/      suíte Unity do disparo, 23 testes
-test/test_mixer/        suíte Unity do mixer, 18 testes
-                        ambas: pio test -e native
+test/test_trigger/      suíte Unity do disparo, 25 testes
+test/test_mixer/        suíte Unity do mixer em ponto fixo, 18 testes
+test/test_audio_block/  suíte Unity do motor float, 16 testes
+test/test_pitch_shift/  suíte Unity do pitch shifter, 13 testes
+                        todas: pio test -e native  (71 casos)
 tools/wav_to_header.py  .wav → header C, com a mesma aritmética da M16
 docs/                   circuit.md, circuit-rc.md, bancada.md, este arquivo
 ```
+
+Todo `.h` em `src/` é compilado **no firmware E nos testes**. É a convenção
+mais importante do repositório, e existe porque o `TriggerInput` já morou no
+`main.cpp` com uma cópia à mão no simulador — e as duas divergiram. DSP novo
+nasce header-only e sem Arduino pelo mesmo motivo.
 
 Os ambientes do PlatformIO compartilham `src/` e são separados por
 `build_src_filter`, porque cada sketch tem o próprio par `setup()`/`loop()`.
@@ -283,12 +430,19 @@ Os ambientes do PlatformIO compartilham `src/` e são separados por
 
 | Item | Como está verificado |
 |---|---|
-| Lógica de disparo | 23 testes no host, e 17/17 batidas na placa |
+| Lógica de disparo | 25 testes no host, e 17/17 batidas na placa |
 | PSRAM, SD, carga dos `.wav` | log de boot em hardware |
-| Ring de DMA de 5,8 ms | 4 vozes simultâneas, por ouvido |
 | Polifonia (soma de vozes) | hardware |
+| Transporte I2S: CPU, jitter, underrun | banco v2 em hardware, 9 profundidades |
+| Ring de DMA de 5,8 ms | 4 vozes por ouvido — **provisório**, M16 trocou de versão desde então |
 | Mixer: ganho e joelho suave | 18 testes no host; **não ouvido em hardware** |
+| Motor de blocos em float | 16 testes no host + boot limpo na placa; **não ouvido** |
+| Pitch shifter | 13 testes no host (DFT confirma a octava) + boot limpo; **não ouvido** |
 | Latência ponta a ponta | **não medida** — fase F pendente |
 | Filtro RC | **não montado** — só simulado |
 | Rejeição de batida fantasma | **não testada** em hardware |
-| Transporte I2S: CPU, jitter, underrun | banco v2 em hardware, 9 profundidades |
+
+A próxima sessão de bancada tem três perguntas acumuladas, todas de ouvido:
+o joelho suave num rolo de quatro vozes, o motor de blocos (que deve soar
+*idêntico* ao anterior — é o que o teste de 1 LSB prevê), e o pitch shifter.
+Mais a reconfirmação dos 5,8 ms nesta versão da M16.
