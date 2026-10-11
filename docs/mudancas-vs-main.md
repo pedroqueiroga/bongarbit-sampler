@@ -18,6 +18,7 @@ Resumo das áreas, cada uma justificada abaixo:
 | 8 | Testes | Suíte de 23 testes no host + simulador | Lógica de disparo era inverificável |
 | 9 | Diagnóstico | Probe de latência; sketch de tom I2S | Medir em vez de estimar |
 | 10 | Docs | `circuit-rc.md`, `bancada.md`, `CLAUDE.md` | Registrar decisões e medições |
+| 11 | Mixer | Ganho por voz, master e joelho suave | Kit normalizado clipava com 2 pads |
 
 ---
 
@@ -196,6 +197,58 @@ Um terceiro sketch implica adicionar exclusão em **todos** os ambientes do
 - [CLAUDE.md](../CLAUDE.md) — as decisões que sustentam o projeto, escritas para
   que a próxima pessoa não as desfaça por parecerem supérfluas.
 
+## 11. Mixer: ganho por voz, master e joelho suave
+
+**Antes:** o `audioUpdate()` somava as vozes e aplicava um clamp duro no fim.
+
+**Por que é problema:** com um kit normalizado — que é o que todo pacote de
+samples entrega — isso clipa por construção. Dois samples com pico em 89% do
+fundo de escala somam 178%. Clamp duro num transiente percussivo soa como
+estalo, e na bancada de 13/08/2026 esses estalos foram confundidos com estouro
+de DMA por um bom tempo.
+
+**Agora:** [src/mixer.h](../src/mixer.h), modelado em como uma MPC resolve —
+que **não** é dividir pelo número de vozes:
+
+- **Ganho Q8 por voz** (`padGain[]`, `trigGain`) e **ganho master**. Um multiply
+  e um shift por voz, sem float no caminho de áudio. Unidade por padrão, então
+  ligar não muda nada audível até o kit ser balanceado; existe para que o
+  controle exista.
+- **Joelho suave** como última linha de defesa:
+  `y = KNEE + (RANGE·over)/(RANGE + over)`, identidade abaixo de 75% do fundo de
+  escala e assintótico ao teto acima. Nunca clipa, para nenhuma entrada.
+
+**Por que essa curva:** derivada exatamente 1 no joelho (C1-contínua, sem quina
+audível onde a compressão começa), assintótica (clipping deixa de ser possível
+por construção, não por ajuste), ímpar, sem estado e sem lookahead — ou seja,
+**sem latência adicional**, o que importa porque os 5,8 ms validados são a razão
+de ser do projeto.
+
+**Alternativas rejeitadas, e o número que decidiu:**
+
+| Abordagem | Por que não |
+|---|---|
+| Dividir por `PAD_COUNT+1` | −12 dB sempre, para um pior caso que raramente ocorre |
+| Ganho dinâmico `1/N` | Pumping: um pad novo abaixa o que já está soando. Em percussão é pior que distorção |
+| Limitador com lookahead | Precisa de linha de atraso — mataria os 5,8 ms |
+| Limitador sem lookahead | Reage depois do transiente que deveria conter |
+
+O argumento mais forte só apareceu ao escrever os testes: para quatro vozes
+ficarem **inteiramente lineares** (abaixo do joelho) cada uma precisaria de
+~**−13,7 dB**, *pior* que os −12 dB do ÷4. Headroom linear para o pior caso é
+caro; o joelho é o que o devolve.
+
+**Verificação:** 18 testes em `test/test_mixer/`, organizados pela propriedade
+que defendem — incluindo um que documenta numericamente a alternativa rejeitada,
+para que o tradeoff continue visível se alguém propuser o ÷4 de novo.
+
+**Custo:** +1208 bytes de RAM, +1580 de flash. Dois `#define` desligam cada
+camada independentemente (`MIXER_GAIN_STAGING`, `MIXER_SOFT_CLIP`), porque isso
+**muda o som do instrumento** e não é decisão para tomar em silêncio.
+
+**Não verificado em hardware ainda.** A aritmética está testada no host; se o
+joelho soa bem num rolo de quatro vozes é questão de bancada.
+
 ---
 
 ## Mapa do repositório
@@ -203,11 +256,14 @@ Um terceiro sketch implica adicionar exclusão em **todos** os ambientes do
 ```
 src/main.cpp            o sampler (setup/loop/audioUpdate)
 src/trigger_input.h     TriggerInput — compilado no firmware E nos testes
+src/mixer.h             ganho por voz, master e joelho suave — idem
 src/test_sd.cpp         diagnóstico de cartão com a SD.h do core (env sd_test)
 src/test_i2s_tone.cpp   tom contínuo falando direto com i2s_std (env i2s_tone)
 sim/trigger_model.h     gerador de traço, modelo RC, designs rejeitados
 sim/trigger_sim.cpp     CLI de varredura (--sweep=all)
-test/test_trigger/      suíte Unity, 23 testes (pio test -e native)
+test/test_trigger/      suíte Unity do disparo, 23 testes
+test/test_mixer/        suíte Unity do mixer, 18 testes
+                        ambas: pio test -e native
 tools/wav_to_header.py  .wav → header C, com a mesma aritmética da M16
 docs/                   circuit.md, circuit-rc.md, bancada.md, este arquivo
 ```
@@ -223,6 +279,7 @@ Os ambientes do PlatformIO compartilham `src/` e são separados por
 | PSRAM, SD, carga dos `.wav` | log de boot em hardware |
 | Ring de DMA de 5,8 ms | 4 vozes simultâneas, por ouvido |
 | Polifonia (soma de vozes) | hardware |
+| Mixer: ganho e joelho suave | 18 testes no host; **não ouvido em hardware** |
 | Latência ponta a ponta | **não medida** — fase F pendente |
 | Filtro RC | **não montado** — só simulado |
 | Rejeição de batida fantasma | **não testada** em hardware |

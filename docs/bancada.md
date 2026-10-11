@@ -575,10 +575,26 @@ depender disso.
 
 Não é detalhe de bancada. O `audioUpdate()` soma as vozes e clipa, sem
 atenuação por voz nem limitador. Um kit de samples normalizado — que é o normal
-— **clipa com dois pads simultâneos, por construção**. As opções são escalar as
-vozes (dividir por `PAD_COUNT + 1`, custando volume), pôr um limitador, ou
-documentar que o material precisa vir com headroom. Hoje é acidente, não
-decisão.
+— **clipa com dois pads simultâneos, por construção**.
+
+**Resolvido em [src/mixer.h](../src/mixer.h)** (branch `feat/mixer-gain-staging`),
+com o modelo de uma MPC em vez de divisão por número de vozes: ganho Q8 por voz,
+ganho master, e um joelho suave como rede de segurança. Verificado por 18 testes
+no host.
+
+O argumento decisivo contra dividir por `PAD_COUNT` apareceu ao escrever esses
+testes, e é mais forte do que parecia: para quatro vozes ficarem **inteiramente
+abaixo do joelho** — lineares, sem compressão nenhuma — cada voz precisaria de
+cerca de **−13,7 dB**, que é *pior* que os −12 dB do ÷4 rejeitado por deixar o
+instrumento baixo. Headroom linear para o pior caso é simplesmente caro. O
+joelho é o que devolve esse headroom: a unidade, uma voz sozinha fica a 10% do
+nível original e quatro vozes ainda não clipam.
+
+Uma correção de percurso que vale registrar: durante a bancada eu afirmei que
+"soft clip mais uns 6 dB de folga no material" bastaria. Não basta — com −6 dB
+por voz, quatro vozes somam 58448, ainda acima do fundo de escala. O que os 6 dB
+garantem é que **uma** voz fica abaixo do joelho, ou seja, bit-exata. O caso de
+quatro vozes depende do joelho, sempre.
 
 ### Comportamento não explicado
 

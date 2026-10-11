@@ -117,6 +117,48 @@ static_assert(DMA_BUFFERS * DMA_BUFFER_LENGTH <= 512,
 // override above.
 #include "trigger_input.h"
 
+// --- Mixer gain staging and output limiting (see src/mixer.h) ---
+// Two independent switches, both on, both reversible, because they change how
+// the instrument sounds and that is not a decision to make silently.
+//
+// MIXER_GAIN_STAGING gives every voice its own Q8 level plus a master level -
+// the MPC model. It defaults to unity everywhere, so turning it on changes
+// nothing audible until a kit is actually dialled in; it exists so that the
+// control is there at all. Deliberately NOT a divide-by-voice-count, which
+// would cost 12dB on one voice to protect a worst case that rarely happens.
+//
+// MIXER_SOFT_CLIP replaces the hard clamp with a knee that is the identity
+// below 75% of full scale and asymptotic to full scale above it. This is the
+// part that removes the clicks: with a normalised kit, two voices sum past
+// full scale and hard-clamping a transient is what produced them.
+//
+// Set MIXER_SOFT_CLIP to 0 to get the previous hard clamp back for comparison.
+#define MIXER_GAIN_STAGING 1
+#define MIXER_SOFT_CLIP    1
+
+#include "mixer.h"
+
+#if MIXER_GAIN_STAGING
+  #define MIXGAIN(s, g) mixApplyGain((s), (g))
+#else
+  #define MIXGAIN(s, g) ((int32_t)(s))
+#endif
+
+#if MIXER_SOFT_CLIP
+  #define MIXCLIP(x) mixSoftClip(x)
+#else
+  #define MIXCLIP(x) mixHardClip(x)
+#endif
+
+#if MIXER_GAIN_STAGING
+// Per-voice and master levels, Q8 (MIX_GAIN_UNITY = 256 = unity). These are
+// the knobs a kit is balanced with: lower a loud sample here rather than
+// re-normalising the .wav. Unity by default - the headroom convention is that
+// kit material carries ~6dB of its own, same as on an MPC.
+int32_t trigGain   = MIX_GAIN_UNITY;
+int32_t masterGain = MIX_GAIN_UNITY;
+#endif
+
 #if USE_SD_SAMPLER
 // --- Which WAV file to load (0 = first file found on the card) ---
 #define FILE_INDEX 0
@@ -138,6 +180,10 @@ Wav             padWav[PAD_COUNT];
 Samp            padSamp[PAD_COUNT];
 uint8_t         padChannels[PAD_COUNT] = {1, 1, 1};
 TriggerInput    padInput[PAD_COUNT];
+#if MIXER_GAIN_STAGING
+// Per-pad level, Q8. Balance the kit here.
+int32_t         padGain[PAD_COUNT] = {MIX_GAIN_UNITY, MIX_GAIN_UNITY, MIX_GAIN_UNITY};
+#endif
 #endif
 
 // --- Latency probe (see docs/circuit-rc.md, "Medir de verdade") ---
@@ -370,7 +416,7 @@ void audioUpdate() {
   } else {
     L = R = samp.next(); // nextStereo() only works for stereo buffers (num_channels==2)
   }
-  int32_t mixL = L, mixR = R;
+  int32_t mixL = MIXGAIN(L, trigGain), mixR = MIXGAIN(R, trigGain);
 
 #if USE_SD_SAMPLER
   // Pads can play concurrently with the main button and with each other -
@@ -382,12 +428,15 @@ void audioUpdate() {
     } else {
       pl = pr = padSamp[i].next();
     }
-    mixL += pl;
-    mixR += pr;
+    mixL += MIXGAIN(pl, padGain[i]);
+    mixR += MIXGAIN(pr, padGain[i]);
   }
 #endif
 
-  int16_t outL = (int16_t)max((int32_t)MIN_16, min((int32_t)MAX_16, mixL));
-  int16_t outR = (int16_t)max((int32_t)MIN_16, min((int32_t)MAX_16, mixR));
-  i2s_write_samples(outL, outR);
+#if MIXER_GAIN_STAGING
+  mixL = mixApplyGain(mixL, masterGain);
+  mixR = mixApplyGain(mixR, masterGain);
+#endif
+
+  i2s_write_samples(MIXCLIP(mixL), MIXCLIP(mixR));
 }
