@@ -995,3 +995,46 @@ PLATFORMIO_BUILD_FLAGS='-DDEBUG_ENGINE=1' pio run -e esp32-s3-devkitc-1 -t uploa
 Os dois diagnósticos (`DEBUG_ENGINE`, `DEBUG_TRIGGERS`) são `#ifndef`-guarded
 justamente para isso: ligar num build sem editar — e sem esquecer de reverter —
 um arquivo versionado.
+
+### Correção: não é junta mecânica, correlaciona com o conector USB
+
+A conclusão acima ("junta mecânica") está **errada**, ou pelo menos superada.
+
+O que foi observado em seguida: o som pega **com confiabilidade** quando a
+placa está ligada pelo conector **COM** (a ponte WCH, USB id `1a86:55d3`), e
+**não pega** quando ligada pelo conector **USB** nativo (GPIO 19/20).
+
+Isso explica os dados melhor do que manipulação explicava:
+
+- "Confiável num conector" não é comportamento de contato intermitente.
+  Intermitência não escolhe conector.
+- As duas quedas vieram logo depois de gravar — e gravar é exatamente quando o
+  cabo troca de porto. A correlação que eu li como "mexer na placa" era a
+  correlação com qual conector estava em uso.
+
+A placa tem **dois** conectores USB, e o `platformio.ini` afirmava que não —
+dizia que só existia o nativo. Essa falsidade já havia custado uma captura
+serial vazia (cabo no COM, `Serial` saindo pelo nativo) e agora estava negando
+a existência do conector que funciona. Corrigido.
+
+#### Mecanismo: ainda não sabido
+
+Hipóteses, em ordem de quão fácil é separá-las:
+
+| Hipótese | Como testar |
+|---|---|
+| **Alimentação/terra** — caminhos de 5V e de retorno diferentes por conector, e o regulador do DAC já esteve marginal nesta bancada (`4vin` mediu 2,75 V numa sessão) | Medir `VIN` e `A3V3` do DAC, com a placa ligada, em cada conector. Sag no nativo = é isso |
+| **O periférico USB nativo em si** — GPIO 19/20 sendo acionados como D-/D+ quando o host enumera | Ligar o conector **nativo** num carregador comum / power bank, sem host de dados. Se funcionar assim, o problema é enumeração/periférico, não o caminho de energia daquele conector |
+| **Algo cabeado perto de 19/20** | Conferir o que está nos headers vizinhos |
+
+O teste do carregador é o que separa energia de periférico sem tocar em código,
+e é por onde começar.
+
+#### Consequência imediata para a bancada
+
+Não é "bug conhecido, conviver": é uma variável que invalida comparações. **Todo
+resultado de ouvido tem que registrar em qual conector a placa estava.** Os
+resultados de 11/10/2026 (motor de blocos e pitch shifter ouvidos) valem — mas
+valem *com* essa anotação, e as medições de latência da fase F não podem ser
+feitas antes disso estar entendido, porque alimentação marginal e latência não
+se separam depois.
