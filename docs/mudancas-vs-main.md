@@ -434,15 +434,19 @@ Os ambientes do PlatformIO compartilham `src/` e são separados por
 | PSRAM, SD, carga dos `.wav` | log de boot em hardware |
 | Polifonia (soma de vozes) | hardware |
 | Transporte I2S: CPU, jitter, underrun | banco v2 em hardware, 9 profundidades |
-| Ring de DMA de 5,8 ms | 4 vozes por ouvido — **provisório**, M16 trocou de versão desde então |
-| Mixer: ganho e joelho suave | 18 testes no host; **não ouvido em hardware** |
-| Motor de blocos em float | 16 testes no host + boot limpo na placa; **não ouvido** |
-| Pitch shifter | 13 testes no host (DFT confirma a octava) + boot limpo; **não ouvido** |
+| Motor de blocos em float | 16 testes no host + **ouvido na placa** em 11/10/2026 |
+| Pitch shifter | 13 testes no host (DFT confirma a octava) + **ouvido na placa**, 11/10/2026 |
+| Ring de DMA de 5,8 ms | ouvido com 1–3 vozes nesta versão da M16; **rolo de 4 vozes não refeito** |
+| Mixer: joelho suave em colisão | 18 testes no host; **não provocado em hardware** (precisa de vozes somando acima do joelho) |
 | Latência ponta a ponta | **não medida** — fase F pendente |
 | Filtro RC | **não montado** — só simulado |
 | Rejeição de batida fantasma | **não testada** em hardware |
 
-A próxima sessão de bancada tem três perguntas acumuladas, todas de ouvido:
-o joelho suave num rolo de quatro vozes, o motor de blocos (que deve soar
-*idêntico* ao anterior — é o que o teste de 1 LSB prevê), e o pitch shifter.
-Mais a reconfirmação dos 5,8 ms nesta versão da M16.
+O que sobrou de ouvido, e é específico:
+
+1. **Rolo de quatro vozes** — fecha de uma vez a reconfirmação dos 5,8 ms *e* o
+   joelho suave, porque é a única condição em que as vozes somam acima do
+   joelho. Hoje os samples estão a ~−16 dB (as cópias atenuadas da escada de
+   DMA), então pode ser preciso subir o `masterGain` para provocar a colisão.
+2. **No pitch shifter:** um clique ao engatar ou soltar (seria a rampa dry/wet
+   falhando) e o *warble* de ~43 Hz, que é esperado e não defeito.

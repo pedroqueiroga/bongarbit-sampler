@@ -901,3 +901,62 @@ ouvido mesmo:
 
 Fase F (latência absoluta) continua pendente e agora tem um componente novo a
 separar: os ~11,6 ms do shifter só existem com o efeito engatado.
+
+---
+
+## 11. O motor de blocos e o pitch shifter, de ouvido — 11/10/2026
+
+Duas das quatro perguntas da seção 10 estão respondidas.
+
+### O susto, e o que ele ensinou
+
+Depois de gravar os três commits que reescreveram o motor de áudio, o
+instrumento ficou **mudo**. Com o firmware recém-trocado, ele era o suspeito
+óbvio.
+
+Não era. `DEBUG_ENGINE` (novo, uma linha por segundo do `loop()`) resolveu numa
+única captura:
+
+```
+ENG blocks/s 1378  peak 5327  playing[trig 1 p1 0 p2 0]  pins[4:0 5:1 6:1 7:0]  fx 1
+```
+
+| Campo | Leitura |
+|---|---|
+| `blocks/s 1378` | Exatamente 44100/32. **O relógio do I2S** estava ditando o ritmo, não o nosso código — e o driver consumia todo bloco. Uma escrita estourando o timeout de 100 ms daria ~10/s |
+| `peak 5327` | Sinal real chegou na última instrução antes do DMA |
+| `playing[...]` | As vozes disparavam |
+| `fx 1` | O efeito engatava |
+
+Da CPU até o GPIO18, tudo certo. O defeito era **conexão** — a mesma classe de
+falha que já custou uma sessão inteira a este projeto quando um GPIO foi
+acusado no lugar de um mau contato.
+
+**A lição é de método:** "parou de funcionar depois da sua mudança" e "a sua
+mudança quebrou" não são a mesma afirmação, e a diferença entre as duas é uma
+medição de dois minutos. Vale gravar porque este projeto já errou exatamente
+assim, na direção oposta — culpando o hardware antes (clipping confundido com
+underrun) e o código agora.
+
+### O resultado
+
+Com o contato resolvido: **som limpo, e o pitch shifter funcionando.** O motor
+de blocos em float e o shifter saem do estado "não ouvido".
+
+O motor soar certo é, em si, a confirmação do que
+`test_float_knee_matches_the_integer_reference` previa: trocar ponto fixo por
+float em todo o caminho de áudio **não mudou o som**.
+
+### O que ainda falta de ouvido
+
+1. **Rolo de quatro vozes.** Fecha de uma vez a reconfirmação dos 5,8 ms nesta
+   versão da M16 *e* o joelho suave, porque é a única condição em que as vozes
+   somam acima do joelho. Detalhe prático: o pico medido foi ~5300 de 32768
+   (≈ −16 dB), porque os samples no cartão são as cópias atenuadas feitas para
+   a escada de DMA. Pode ser preciso subir o `masterGain` para provocar a
+   colisão de verdade.
+2. **No shifter, duas coisas específicas:** um clique ao engatar ou soltar
+   (seria a rampa dry/wet falhando) e o *warble* de ~43 Hz, que é previsto e
+   não é defeito.
+
+Fase F (latência absoluta) continua pendente.

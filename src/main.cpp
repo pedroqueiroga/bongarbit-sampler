@@ -116,6 +116,31 @@ static_assert(DMA_BUFFERS * DMA_BUFFER_LENGTH <= 512,
 // it on to diagnose an input problem, never while judging latency.
 #define DEBUG_BOOT     1
 #define DEBUG_TRIGGERS 0
+
+// DEBUG_ENGINE prints one line per second from loop() with the state of the
+// whole audio path: blocks rendered, peak sample produced, which voices think
+// they are playing, and the raw level of every input pin.
+//
+// It exists because "no sound" has at least four distinct causes in this
+// firmware and they are indistinguishable by ear: the audio task not running,
+// the voices never starting, the mix coming out as zeroes, or the DAC not
+// converting. One line separates all four. It costs a blocking USB CDC write
+// in loop() once a second, so it does belong off while judging latency - but
+// unlike DEBUG_TRIGGERS it is not in the per-strike path.
+//
+// It earned its place on 11/10/2026. The instrument went silent right after
+// three commits that rewrote the whole audio engine, which made the firmware
+// the obvious suspect. One line of this ruled it out in a single capture:
+//
+//   ENG blocks/s 1378  peak 5327  playing[trig 1 p1 0 p2 0]  pins[...]  fx 1
+//
+// 1378 blocks/s is exactly 44100/32, so the I2S clock - not our code - was
+// setting the pace, and the driver was consuming every block (a timing-out
+// write would have shown ~10/s). A non-zero peak meant real signal reached the
+// last instruction before the DMA. The fault was a connection, the same class
+// of fault that had already cost this project a full bench session while a
+// dead GPIO was blamed instead.
+#define DEBUG_ENGINE   0
 #if DEBUG_BOOT
   #define DBG(...) Serial.printf(__VA_ARGS__)
 #else
@@ -480,6 +505,15 @@ void setup() {
 #endif
 }
 
+#if DEBUG_ENGINE
+// Written by the audio task, read by loop(). Plain counters rather than
+// anything synchronised: a torn read costs one wrong diagnostic line, and
+// adding a lock to the audio path to protect a debug print would be a worse
+// bug than the one being diagnosed.
+volatile uint32_t engineBlocks = 0;
+volatile int32_t  enginePeak   = 0;   // |sample| as written to the DAC
+#endif
+
 void loop() {
   // One timestamp for the whole sweep, so every input is conditioned against
   // the same instant. Nothing blocking belongs in this function: with
@@ -519,6 +553,36 @@ void loop() {
 
 #if LATENCY_PROBE
   probePoll();
+#endif
+
+#if DEBUG_ENGINE
+  // Once a second, the whole audio path in one line.
+  //
+  //   blocks/s ~1378 -> the audio task is running at the expected rate
+  //            0     -> it is not running at all
+  //   peak     0     -> the mix really is silence, so look upstream
+  //            >0    -> the firmware IS producing signal, so look at the DAC
+  //   playing  which voices believe they are sounding
+  //   pins     raw levels; 0 = pressed (INPUT_PULLUP), 1 = released
+  static uint32_t lastReport = 0;
+  static uint32_t lastBlocks = 0;
+  if ((uint32_t)(now_us - lastReport) >= 1000000UL) {
+    uint32_t blocks = engineBlocks;
+    int32_t  peak   = enginePeak;
+    enginePeak = 0;
+    Serial.printf("ENG blocks/s %lu  peak %ld  playing[trig %d",
+                  (unsigned long)(blocks - lastBlocks), (long)peak,
+                  samp.isPlaying() ? 1 : 0);
+#if USE_SD_SAMPLER
+    for (uint8_t i = 0; i < PAD_COUNT; i++)
+      Serial.printf(" p%u %d", i + 1, padSamp[i].isPlaying() ? 1 : 0);
+#endif
+    Serial.printf("]  pins[4:%d 5:%d 6:%d 7:%d]  fx %d\n",
+                  digitalRead(4), digitalRead(5), digitalRead(6), digitalRead(7),
+                  pitchShift.isEngaged() ? 1 : 0);
+    lastReport = now_us;
+    lastBlocks = blocks;
+  }
 #endif
 }
 
@@ -587,7 +651,16 @@ void audioUpdate() {
   // anything if M16's dual-core block-split mode is ever active. It clips to
   // 16 bits itself, which is a no-op after audioToI16().
   for (int n = 0; n < AUDIO_BLOCK_FRAMES; n++) {
-    audioBlockWrite(audioToI16(MIXCLIP(MIXGAIN(blk.l[n], masterGain))),
-                    audioToI16(MIXCLIP(MIXGAIN(blk.r[n], masterGain))));
+    int16_t outL = audioToI16(MIXCLIP(MIXGAIN(blk.l[n], masterGain)));
+    int16_t outR = audioToI16(MIXCLIP(MIXGAIN(blk.r[n], masterGain)));
+#if DEBUG_ENGINE
+    int32_t mag = outL < 0 ? -(int32_t)outL : (int32_t)outL;
+    if (mag > enginePeak) enginePeak = mag;
+#endif
+    audioBlockWrite(outL, outR);
   }
+
+#if DEBUG_ENGINE
+  engineBlocks++;
+#endif
 }
