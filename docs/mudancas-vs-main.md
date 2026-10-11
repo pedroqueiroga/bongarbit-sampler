@@ -170,13 +170,21 @@ não dizem nada sobre a PSRAM ter inicializado.
   pino de ADC. Um marcador em GPIO não serviria — o dreno do DMA e o filtro do
   DAC acontecem *depois* de a CPU escrever, e são justamente os termos a
   calibrar. Ainda não executado.
-- **`src/test_i2s_tone.cpp`** (ambiente `i2s_tone`): gera uma onda quadrada
-  contínua falando direto com o driver `i2s_std`, sem M16, sem SdFat, sem
-  samples — e **confere o retorno de cada chamada**, que a M16 não faz (um
-  `i2s_new_channel()` falho é silencioso e o `M16 is running` é impresso de
-  qualquer jeito). Serve para separar "este DAC consegue emitir som" de qualquer
-  coisa que o firmware possa estar fazendo errado, do mesmo modo que o `sd_test`
-  separa o cartão da SdFat. **Compila, nunca foi executado em hardware.**
+- **`src/test_i2s_bench.cpp`** (ambiente `i2s_bench`): banco de medição do
+  transporte de áudio, falando direto com `i2s_std` — sem M16, sem SdFat. Nasceu
+  como gerador de tom para separar "este DAC consegue emitir som" de qualquer
+  coisa que o firmware pudesse estar fazendo errado (o mesmo papel que o
+  `sd_test` tem para o cartão), e virou o instrumento que decidiu a
+  arquitetura. Mede CPU real, jitter e underrun de três modelos de alimentação
+  em nove profundidades de ring. Resultados em
+  [bancada.md, seção 9](bancada.md).
+
+  O que ele achou: a escrita por amostra da M16 custa **21-34% de um core**, e
+  trocar para escrita por bloco recupera quase tudo (**2,3%**); o modelo de ISR
+  vai limpo até **0,36 ms** de ring; o despacho de interrupção do IDF custa
+  ~1.380 ciclos, o que faz `2 × 16` ser mais barato que `4 × 8` com a mesma
+  latência; e quatro vozes lidas da PSRAM pelo mixer custam 110 ciclos/frame,
+  confirmando com número o "sub-microssegundo" que o `main.cpp` afirmava.
 
 Um terceiro sketch implica adicionar exclusão em **todos** os ambientes do
 `platformio.ini`, não só no novo.
@@ -258,7 +266,7 @@ src/main.cpp            o sampler (setup/loop/audioUpdate)
 src/trigger_input.h     TriggerInput — compilado no firmware E nos testes
 src/mixer.h             ganho por voz, master e joelho suave — idem
 src/test_sd.cpp         diagnóstico de cartão com a SD.h do core (env sd_test)
-src/test_i2s_tone.cpp   tom contínuo falando direto com i2s_std (env i2s_tone)
+src/test_i2s_bench.cpp  banco de medição de I/O I2S, sem M16 (env i2s_bench)
 sim/trigger_model.h     gerador de traço, modelo RC, designs rejeitados
 sim/trigger_sim.cpp     CLI de varredura (--sweep=all)
 test/test_trigger/      suíte Unity do disparo, 23 testes
@@ -283,4 +291,4 @@ Os ambientes do PlatformIO compartilham `src/` e são separados por
 | Latência ponta a ponta | **não medida** — fase F pendente |
 | Filtro RC | **não montado** — só simulado |
 | Rejeição de batida fantasma | **não testada** em hardware |
-| Sketch `i2s_tone` | **compila, nunca executado** |
+| Transporte I2S: CPU, jitter, underrun | banco v2 em hardware, 9 profundidades |

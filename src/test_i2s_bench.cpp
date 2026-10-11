@@ -1,156 +1,226 @@
 /*
- * I2S I/O measurement bench - no M16, no SdFat, no samples.
+ * I2S I/O measurement bench - no M16, no SdFat.
  *
- * Exists to answer the questions that decide the audio architecture, none of
- * which can be answered by reading code:
+ * Exists to answer the question that decides the audio architecture: stay on
+ * M16's audio task, or feed the DMA from an ISR and write the audio core.
  *
- *   1. What is the real minimum dma_frame_num the ESP-IDF driver accepts?
- *      The latency ladder in main.cpp assumes it goes down to 16, or even to
- *      2 descriptors of 16. That is arithmetic, not a measured limit.
- *   2. What does M16's one-write-per-sample path actually cost? It calls
- *      i2s_channel_write() with 4 bytes, 44100 times a second. The suspicion
- *      is that this overhead is what stops shallow rings from working.
- *   3. Is an ISR-fill model (i2s_channel_register_event_callback + on_sent)
- *      cheaper, and by how much? That is the model that would replace M16's
- *      audio core if the answer is "a lot".
- *   4. Where do underruns actually start?
+ * v1 of this bench reached the right conclusion from two broken metrics, and
+ * v2 exists to fix both:
  *
- * It measures all four by running the same square wave through three feed
- * models at every ring depth the driver accepts, and reporting the share of
- * one core each model burns plus the underrun count.
+ *   - cpu% measured cycles spent INSIDE i2s_channel_write(), which blocks. For
+ *     a blocking call that is wall time, not CPU, so every task row read ~99%
+ *     by construction. Now a low-priority task counts in a tight loop and the
+ *     drop against an idle baseline is the CPU that was taken away. That also
+ *     captures what the old metric could not see at all: the IDF's own
+ *     interrupt prologue, dispatch and queue handling, which happen outside the
+ *     callback and grow as the ring gets shallower.
+ *   - "underruns" counted on_send_q_ovf, which fires once per completed
+ *     descriptor when nothing calls i2s_channel_write(). In the ISR model that
+ *     is every descriptor, so it read as catastrophic while the tone was
+ *     audibly fine. Now the ISR model times the interval between refills and
+ *     flags the late ones, which is what an underrun actually is.
  *
- * WHAT IT DOES NOT MEASURE
+ * Also new: the fill can read four real voices out of PSRAM through the actual
+ * mixer (src/mixer.h) instead of a synthetic square wave. v1 measured 17.5
+ * cycles per frame for a generator that does one compare and two stores; a
+ * voice that reads out of PSRAM can miss cache, and that term is what this
+ * project has been calling "sub-microsecond" without ever measuring it. The ISR
+ * runs both fills, so the difference between those two rows IS the PSRAM cost.
  *
- * Absolute trigger-to-sound latency. The DAC's own digital filter adds a fixed
- * ~0.50ms on this board (FLT tied low; 80us if it is ever strapped high), and
- * that offset is identical in every configuration here. It cancels out of the
- * comparison, which is why this bench is still useful without touching it.
+ * WHAT IT STILL DOES NOT MEASURE
  *
- * READING THE OUTPUT
- *
- * cpu% is the share of one core spent inside the feed path - driver calls for
- * the task models, the callback for the ISR model. Lower is what buys shallow
- * rings: the overhead per sample is what makes a 16-frame ring impossible.
- *
- * underruns counts on_send_q_ovf events: the DMA reached a descriptor with
- * nothing new in it. Non-zero means that configuration does not hold.
+ * Absolute trigger-to-sound latency. The DAC's digital filter adds a fixed
+ * ~0.50ms on this board (FLT tied low; 80us if ever strapped high) and cancels
+ * out of every comparison here.
  *
  * SCOPE MARKER
  *
- * BENCH_MARKER_GPIO goes high for the duration of each ISR fill, written with
- * the raw GPIO registers rather than gpio_set_level() so the marker does not
- * inflate what it is measuring. Probe it to see jitter directly - the cycle
- * histogram below gives min/avg/max, but not the distribution shape.
+ * BENCH_MARKER_GPIO is high for the duration of each ISR fill, written through
+ * the GPIO registers so the marker does not inflate what it measures. The cycle
+ * counters give min/avg/max; the marker gives the distribution shape, which is
+ * what jitter is.
  */
 #include <Arduino.h>
 #include <driver/i2s_std.h>
 #include <esp_cpu.h>
+#include <esp_heap_caps.h>
 #include <soc/gpio_reg.h>
+#include "mixer.h"
 
-// Free in this design: 4-7 are buttons, 10-13 the SD card, 16-18 I2S, and
-// GPIO1 is reserved for the latency probe in main.cpp.
+// Free in this design: 4-7 buttons, 10-13 SD, 16-18 I2S, GPIO1 reserved for the
+// latency probe in main.cpp.
 #define BENCH_MARKER_GPIO 8
 static_assert(BENCH_MARKER_GPIO < 32, "marker uses GPIO_OUT_W1TS_REG, which only covers 0-31");
 
 #define BENCH_SAMPLE_RATE 44100
-#define BENCH_SECONDS     3      // per configuration, per feed model
+#define BENCH_MS          2000   // per row
+#define BENCH_VOICES      4
+#define VOICE_FRAMES      44100  // 1s each, ~88KB in PSRAM - big enough to miss cache
 #define TONE_PERIOD       100    // frames per cycle -> 441 Hz
-#define TONE_AMPLITUDE    8000   // well clear of full scale; this is not a level test
+#define TONE_AMPLITUDE    8000
 
-// Ring depths to try, deepest first. The last three are the rungs the latency
-// ladder in main.cpp wants but has never reached.
+// The feeder runs above the counter task, so the counter only gets the core
+// when the feeder blocks - that is what makes the counter a CPU measurement
+// rather than a wall-clock one.
+#define FEEDER_PRIORITY  23
+#define COUNTER_PRIORITY 1
+#define BENCH_CORE       1
+
 struct BenchCfg { uint32_t descriptors; uint32_t frames; };
 static const BenchCfg kConfigs[] = {
-    {4, 512}, // M16's default: 46.4ms
-    {4, 256}, // 23.2ms
-    {4, 128}, // 11.6ms
-    {4, 64},  //  5.8ms - validated by ear on 13/08/2026
-    {4, 32},  //  2.9ms
-    {4, 16},  //  1.5ms
-    {4, 8},   //  0.73ms
-    {2, 16},  //  0.73ms with the minimum descriptor count for double buffering
-    {2, 8},   //  0.36ms
+    {4, 512}, {4, 256}, {4, 128}, {4, 64}, {4, 32}, {4, 16}, {4, 8},
+    {2, 16},  {2, 8},
 };
 
 enum FeedModel { FEED_ISR, FEED_TASK_BLOCK, FEED_TASK_PER_SAMPLE };
+enum FillKind  { FILL_SYNTH, FILL_VOICES };
 
-static const char* feedName(FeedModel m) {
+struct Row { FeedModel model; FillKind fill; };
+static const Row kRows[] = {
+    {FEED_ISR, FILL_VOICES},             // the architecture candidate, realistic load
+    {FEED_ISR, FILL_SYNTH},              // same, trivial load: the delta is PSRAM
+    {FEED_TASK_BLOCK, FILL_VOICES},
+    {FEED_TASK_PER_SAMPLE, FILL_VOICES}, // what M16 does today
+};
+
+static const char* modelName(FeedModel m) {
   switch (m) {
     case FEED_ISR:             return "ISR on_sent";
     case FEED_TASK_BLOCK:      return "task, block";
-    case FEED_TASK_PER_SAMPLE: return "task, 1 frame (M16)";
+    case FEED_TASK_PER_SAMPLE: return "task, 1 frame";
   }
   return "?";
 }
+static const char* fillName(FillKind f) { return f == FILL_VOICES ? "4 voices/PSRAM" : "synth"; }
 
-// --- Shared state. Plain .bss, which is internal DRAM, so the ISR can touch
-// it without risking a cache miss on PSRAM. ---
+// --- State. Plain .bss is internal DRAM, so the ISR can touch it freely. ---
 static i2s_chan_handle_t s_tx = NULL;
-static volatile uint32_t s_phase      = 0;
-static volatile uint32_t s_fills      = 0;
-static volatile uint32_t s_underruns  = 0;
-static volatile uint32_t s_cycleMin   = 0xFFFFFFFF;
-static volatile uint32_t s_cycleMax   = 0;
-static volatile uint64_t s_cycleTotal = 0;
+static int16_t* s_voice[BENCH_VOICES]    = {NULL, NULL, NULL, NULL};
+static uint32_t s_voicePos[BENCH_VOICES] = {0, 0, 0, 0};
+static FillKind s_fill = FILL_SYNTH;
 
-static inline void statsReset() {
-  s_phase = 0; s_fills = 0; s_underruns = 0;
-  s_cycleMin = 0xFFFFFFFF; s_cycleMax = 0; s_cycleTotal = 0;
+static volatile uint32_t s_phase       = 0;
+static volatile uint32_t s_fills       = 0;
+static volatile uint32_t s_cycleMin    = 0xFFFFFFFF;
+static volatile uint32_t s_cycleMax    = 0;
+static volatile uint64_t s_cycleTotal  = 0;
+static volatile uint32_t s_lastCall    = 0;  // cycle stamp of the previous refill
+static volatile uint32_t s_gapMax      = 0;
+static volatile uint32_t s_late        = 0;  // refills arriving past 2x the period
+static volatile uint32_t s_starved     = 0;  // past the whole ring: a real underrun
+static volatile uint32_t s_expectedGap = 0;
+static volatile uint32_t s_ringGap     = 0;
+static volatile uint32_t s_qOverflow   = 0;
+
+// CPU load probe
+static volatile uint32_t s_counter = 0;
+static TaskHandle_t s_counterTask  = NULL;
+static uint32_t s_baselineRate     = 0;  // counts per ms with nothing else running
+
+static void counterTaskFn(void*) {
+  for (;;) s_counter = s_counter + 1;
 }
 
-static inline void statsRecord(uint32_t cycles) {
-  // Explicit read-modify-write: ++ on a volatile is deprecated in C++20.
-  s_fills = s_fills + 1;
-  s_cycleTotal = s_cycleTotal + cycles;
-  if (cycles < s_cycleMin) s_cycleMin = cycles;
-  if (cycles > s_cycleMax) s_cycleMax = cycles;
+/* Samples the counter over ms milliseconds, in counts per ms. The caller must
+ * be blocked for the whole window, or it measures itself. */
+static uint32_t counterRate(uint32_t ms) {
+  uint32_t c0 = s_counter;
+  uint32_t t0 = millis();
+  delay(ms);
+  uint32_t dt = millis() - t0;
+  uint32_t dc = s_counter - c0;
+  return dt ? dc / dt : 0;
 }
 
-/* Generate the test signal into a frame buffer. Deliberately trivial - this
- * bench measures the cost of moving samples, not of producing them. */
-static inline void IRAM_ATTR fillFrames(int16_t* dst, size_t frames) {
+static inline void statsReset(const BenchCfg& cfg) {
+  s_phase = 0; s_fills = 0; s_cycleMin = 0xFFFFFFFF; s_cycleMax = 0;
+  s_cycleTotal = 0; s_lastCall = 0; s_gapMax = 0; s_late = 0; s_starved = 0;
+  s_qOverflow = 0;
+  for (int v = 0; v < BENCH_VOICES; v++) s_voicePos[v] = v * 1000; // spread the reads
+  uint64_t cyclesPerFrame = (uint64_t)getCpuFrequencyMhz() * 1000000ULL / BENCH_SAMPLE_RATE;
+  s_expectedGap = (uint32_t)(cyclesPerFrame * cfg.frames);
+  s_ringGap     = (uint32_t)(cyclesPerFrame * cfg.frames * cfg.descriptors);
+}
+
+/* Trivial generator: one compare and two stores per frame. */
+static inline void IRAM_ATTR fillSynth(int16_t* dst, size_t frames) {
   uint32_t ph = s_phase;
   for (size_t i = 0; i < frames; i++) {
     int16_t v = (ph < TONE_PERIOD / 2) ? TONE_AMPLITUDE : -TONE_AMPLITUDE;
-    dst[2 * i]     = v; // left
-    dst[2 * i + 1] = v; // right
+    dst[2 * i]     = v;
+    dst[2 * i + 1] = v;
     if (++ph >= TONE_PERIOD) ph = 0;
   }
   s_phase = ph;
 }
 
-/* on_sent: the descriptor just drained, refill it in place. This is the model
- * that would replace M16's audio task - no task wakeup, no semaphore wait, the
- * hardware sets the pace and we answer.
- *
- * IRAM_ATTR because an ISR that lives in flash freezes whenever the cache is
- * disabled. Note that the driver's own ISR is only IRAM-safe if the IDF was
- * built with CONFIG_I2S_ISR_IRAM_SAFE, which the Arduino prebuilt libraries
- * most likely do not set - fine here, since nothing in this sketch writes
- * flash, but it is a real constraint for a production ISR feed. */
+/* Four voices read out of PSRAM, summed through the real mixer: per-voice Q8
+ * gain, sum in int32, one limit at the end - the shape audioUpdate() has. The
+ * reads are what can miss cache. */
+static inline void IRAM_ATTR fillVoices(int16_t* dst, size_t frames) {
+  uint32_t pos[BENCH_VOICES];
+  for (int v = 0; v < BENCH_VOICES; v++) pos[v] = s_voicePos[v];
+
+  for (size_t i = 0; i < frames; i++) {
+    int32_t mix = 0;
+    for (int v = 0; v < BENCH_VOICES; v++) {
+      mix += mixApplyGain(s_voice[v][pos[v]], MIX_GAIN_UNITY / 2);
+      if (++pos[v] >= VOICE_FRAMES) pos[v] = 0;
+    }
+    int16_t out = mixSoftClip(mix);
+    dst[2 * i]     = out;
+    dst[2 * i + 1] = out;
+  }
+
+  for (int v = 0; v < BENCH_VOICES; v++) s_voicePos[v] = pos[v];
+}
+
+static inline void IRAM_ATTR fillFrames(int16_t* dst, size_t frames) {
+  if (s_fill == FILL_VOICES) fillVoices(dst, frames);
+  else                       fillSynth(dst, frames);
+}
+
+/* on_sent: the descriptor just drained, refill it in place. No task wakeup, no
+ * semaphore wait - the hardware sets the pace and we answer. IRAM_ATTR because
+ * an ISR living in flash freezes whenever the cache is disabled. */
 static bool IRAM_ATTR onSent(i2s_chan_handle_t, i2s_event_data_t* evt, void*) {
   uint32_t t0 = esp_cpu_get_cycle_count();
   REG_WRITE(GPIO_OUT_W1TS_REG, 1u << BENCH_MARKER_GPIO);
 
-  // dma_buf, NOT the deprecated evt->data: the header documents data as "the
-  // secondary pointer" and dma_buf as "the first level pointer of DMA buffer
-  // that just finished sending". They are different levels of indirection, so
-  // using the deprecated one writes to the wrong address.
+  // Interval since the previous refill. Late means the fill is falling behind
+  // the DMA; past the whole ring means the DAC has already replayed stale data,
+  // which is what an underrun actually is here.
+  if (s_lastCall) {
+    uint32_t gap = t0 - s_lastCall;
+    if (gap > s_gapMax)          s_gapMax = gap;
+    if (gap > 2 * s_expectedGap) s_late = s_late + 1;
+    if (gap > s_ringGap)         s_starved = s_starved + 1;
+  }
+  s_lastCall = t0;
+
+  // dma_buf, NOT the deprecated evt->data: the header calls data "the secondary
+  // pointer" and dma_buf "the first level pointer of DMA buffer that just
+  // finished sending". Different levels of indirection.
   fillFrames((int16_t*)evt->dma_buf, evt->size / 4); // 4 bytes per stereo frame
 
   REG_WRITE(GPIO_OUT_W1TC_REG, 1u << BENCH_MARKER_GPIO);
-  statsRecord(esp_cpu_get_cycle_count() - t0);
-  return false; // nothing to wake
-}
 
-static bool IRAM_ATTR onSendOverflow(i2s_chan_handle_t, i2s_event_data_t*, void*) {
-  s_underruns = s_underruns + 1;
+  uint32_t dt = esp_cpu_get_cycle_count() - t0;
+  s_fills      = s_fills + 1;
+  s_cycleTotal = s_cycleTotal + dt;
+  if (dt < s_cycleMin) s_cycleMin = dt;
+  if (dt > s_cycleMax) s_cycleMax = dt;
   return false;
 }
 
-/* Bring up a channel at the requested ring depth. Returns the driver's verdict
- * instead of asserting, because "which depths are rejected" is one of the
- * things being measured. */
+/* Reported, not trusted. In the ISR model this fires once per completed
+ * descriptor because nothing consumes the driver's send queue - it is NOT an
+ * underrun, which is exactly the mistake v1 made. */
+static bool IRAM_ATTR onSendOverflow(i2s_chan_handle_t, i2s_event_data_t*, void*) {
+  s_qOverflow = s_qOverflow + 1;
+  return false;
+}
+
 static esp_err_t channelOpen(const BenchCfg& cfg, FeedModel model) {
   i2s_chan_config_t chanCfg = {
       .id            = I2S_NUM_0,
@@ -178,7 +248,6 @@ static esp_err_t channelOpen(const BenchCfg& cfg, FeedModel model) {
   err = i2s_channel_init_std_mode(s_tx, &stdCfg);
   if (err != ESP_OK) { i2s_del_channel(s_tx); s_tx = NULL; return err; }
 
-  // Callbacks must be registered while the channel is READY, before enable.
   i2s_event_callbacks_t cbs = {};
   cbs.on_send_q_ovf = onSendOverflow;
   if (model == FEED_ISR) cbs.on_sent = onSent;
@@ -197,101 +266,140 @@ static void channelClose() {
   s_tx = NULL;
 }
 
-/* Feed from this task, one block per write - the efficient shape. */
-static void feedTaskBlock(const BenchCfg& cfg, uint32_t ms) {
-  static int16_t block[2 * 1024];
-  size_t frames = cfg.frames;
-  if (frames > 1024) frames = 1024;
-  uint32_t until = millis() + ms;
-  while ((int32_t)(millis() - until) < 0) {
-    fillFrames(block, frames);
-    size_t wrote = 0;
-    uint32_t t0 = esp_cpu_get_cycle_count();
-    i2s_channel_write(s_tx, block, frames * 4, &wrote, portMAX_DELAY);
-    statsRecord(esp_cpu_get_cycle_count() - t0);
-  }
+// --- Feeder task, above the counter so the counter measures CPU ---
+static volatile bool s_feederRun = false;
+static TaskHandle_t  s_feeder    = NULL;
+static BenchCfg      s_feederCfg = {0, 0};
+static FeedModel     s_feederModel = FEED_TASK_BLOCK;
+
+static inline void recordWrite(uint32_t dt) {
+  s_fills      = s_fills + 1;
+  s_cycleTotal = s_cycleTotal + dt;
+  if (dt < s_cycleMin) s_cycleMin = dt;
+  if (dt > s_cycleMax) s_cycleMax = dt;
 }
 
-/* Feed from this task, one stereo frame per write - exactly what M16 does in
- * _i2s_write_samples_direct_external(). The point of the bench. */
-static void feedTaskPerSample(uint32_t ms) {
-  int16_t frame[2];
-  uint32_t until = millis() + ms;
-  while ((int32_t)(millis() - until) < 0) {
-    fillFrames(frame, 1);
+static void feederTaskFn(void*) {
+  static int16_t block[2 * 512];
+  size_t frames = s_feederCfg.frames;
+  if (frames > 512) frames = 512;
+
+  while (s_feederRun) {
     size_t wrote = 0;
-    uint32_t t0 = esp_cpu_get_cycle_count();
-    i2s_channel_write(s_tx, frame, 4, &wrote, portMAX_DELAY);
-    statsRecord(esp_cpu_get_cycle_count() - t0);
+    if (s_feederModel == FEED_TASK_PER_SAMPLE) {
+      int16_t frame[2];
+      fillFrames(frame, 1);
+      uint32_t t0 = esp_cpu_get_cycle_count();
+      i2s_channel_write(s_tx, frame, 4, &wrote, portMAX_DELAY);
+      recordWrite(esp_cpu_get_cycle_count() - t0);
+    } else {
+      fillFrames(block, frames);
+      uint32_t t0 = esp_cpu_get_cycle_count();
+      i2s_channel_write(s_tx, block, frames * 4, &wrote, portMAX_DELAY);
+      recordWrite(esp_cpu_get_cycle_count() - t0);
+    }
   }
+  s_feeder = NULL;
+  vTaskDelete(NULL);
 }
 
-static void runOne(const BenchCfg& cfg, FeedModel model) {
+static void runRow(const BenchCfg& cfg, const Row& row) {
   float ringMs = 1000.0f * cfg.descriptors * cfg.frames / BENCH_SAMPLE_RATE;
-  Serial.printf("%u x %-4u  %6.2f ms  %-20s ", (unsigned)cfg.descriptors,
-                (unsigned)cfg.frames, ringMs, feedName(model));
+  Serial.printf("%u x %-3u %6.2fms  %-14s %-15s ", (unsigned)cfg.descriptors,
+                (unsigned)cfg.frames, ringMs, modelName(row.model), fillName(row.fill));
 
-  statsReset();
-  esp_err_t err = channelOpen(cfg, model);
+  s_fill = row.fill;
+  statsReset(cfg);
+
+  esp_err_t err = channelOpen(cfg, row.model);
   if (err != ESP_OK) {
-    Serial.printf("REJECTED by driver: %s\n", esp_err_to_name(err));
+    Serial.printf("REJECTED: %s\n", esp_err_to_name(err));
     return;
   }
 
-  uint32_t cpuHz   = getCpuFrequencyMhz() * 1000000UL;
-  uint32_t startMs = millis();
-  uint32_t t0      = esp_cpu_get_cycle_count();
-
-  switch (model) {
-    case FEED_ISR:             delay(BENCH_SECONDS * 1000); break;
-    case FEED_TASK_BLOCK:      feedTaskBlock(cfg, BENCH_SECONDS * 1000); break;
-    case FEED_TASK_PER_SAMPLE: feedTaskPerSample(BENCH_SECONDS * 1000); break;
+  if (row.model != FEED_ISR) {
+    s_feederCfg   = cfg;
+    s_feederModel = row.model;
+    s_feederRun   = true;
+    xTaskCreatePinnedToCore(feederTaskFn, "feeder", 4096, NULL, FEEDER_PRIORITY,
+                            &s_feeder, BENCH_CORE);
   }
 
-  uint32_t elapsedCycles = esp_cpu_get_cycle_count() - t0;
-  uint32_t elapsedMs     = millis() - startMs;
+  uint32_t rate = counterRate(BENCH_MS); // blocks here; the work happens around us
+
+  if (row.model != FEED_ISR) {
+    s_feederRun = false;
+    while (s_feeder) delay(1);
+  }
   channelClose();
 
-  uint32_t fills = s_fills;
-  uint64_t busy  = s_cycleTotal;
-  float cpuPct   = elapsedCycles ? (100.0f * (float)busy / (float)elapsedCycles) : 0.0f;
-  float perSec   = elapsedMs ? (1000.0f * fills / elapsedMs) : 0.0f;
-  float avgCyc   = fills ? (float)busy / fills : 0.0f;
-  float avgUs    = avgCyc * 1000000.0f / cpuHz;
+  float cpuPct = s_baselineRate ? 100.0f * (1.0f - (float)rate / (float)s_baselineRate) : 0.0f;
+  if (cpuPct < 0) cpuPct = 0;
 
-  Serial.printf("cpu %5.1f%%  fills/s %8.0f  cycles min/avg/max %5u/%7.0f/%6u  (%5.2f us)  underruns %u\n",
+  uint32_t fills = s_fills;
+  float perSec = 1000.0f * fills / BENCH_MS;
+  float avgCyc = fills ? (float)s_cycleTotal / fills : 0.0f;
+  float gapPct = s_expectedGap ? 100.0f * s_gapMax / s_expectedGap : 0.0f;
+
+  Serial.printf("cpu %5.1f%%  fills/s %7.0f  cyc %6u/%8.0f/%7u  ",
                 cpuPct, perSec, (unsigned)(fills ? s_cycleMin : 0), avgCyc,
-                (unsigned)s_cycleMax, avgUs, (unsigned)s_underruns);
+                (unsigned)s_cycleMax);
+  if (row.model == FEED_ISR) {
+    Serial.printf("gap_max %4.0f%%  late %u  STARVED %u  qovf %u\n",
+                  gapPct, (unsigned)s_late, (unsigned)s_starved, (unsigned)s_qOverflow);
+  } else {
+    Serial.printf("qovf %u\n", (unsigned)s_qOverflow);
+  }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  delay(2500);
   Serial.println();
-  Serial.println("=== I2S I/O bench (no M16) ===");
-  Serial.printf("CPU %u MHz, %d Hz stereo 16-bit, BCK=16 WS=17 DOUT=18\n",
-                getCpuFrequencyMhz(), BENCH_SAMPLE_RATE);
-  Serial.printf("ISR marker on GPIO%d, %d s per run\n\n", BENCH_MARKER_GPIO, BENCH_SECONDS);
+  Serial.println("=== I2S I/O bench v2 (no M16) ===");
+  Serial.printf("CPU %u MHz, %d Hz stereo 16-bit, BCK=16 WS=17 DOUT=18, marker GPIO%d\n",
+                getCpuFrequencyMhz(), BENCH_SAMPLE_RATE, BENCH_MARKER_GPIO);
 
   pinMode(BENCH_MARKER_GPIO, OUTPUT);
   digitalWrite(BENCH_MARKER_GPIO, LOW);
 
-  const FeedModel models[] = {FEED_ISR, FEED_TASK_BLOCK, FEED_TASK_PER_SAMPLE};
+  // A priority-1 task in a tight loop starves IDLE on this core, which trips
+  // the task watchdog. This is a bench, so drop the watchdog rather than
+  // distort the measurement with a periodic yield.
+  disableCore1WDT();
+
+  for (int v = 0; v < BENCH_VOICES; v++) {
+    s_voice[v] = (int16_t*)heap_caps_malloc(VOICE_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!s_voice[v]) {
+      Serial.println("PSRAM alloc FAILED - the 4-voice rows cannot run");
+      while (1) delay(1000);
+    }
+    for (uint32_t i = 0; i < VOICE_FRAMES; i++) // content is irrelevant, only the reads matter
+      s_voice[v][i] = (int16_t)((i * (7 + v)) & 0x3FFF) - 8192;
+  }
+  Serial.printf("4 voice buffers of %u frames in PSRAM (%u KB)\n",
+                VOICE_FRAMES, (unsigned)(BENCH_VOICES * VOICE_FRAMES * 2 / 1024));
+
+  xTaskCreatePinnedToCore(counterTaskFn, "cpucount", 2048, NULL, COUNTER_PRIORITY,
+                          &s_counterTask, BENCH_CORE);
+  delay(200);
+  s_baselineRate = counterRate(1000);
+  Serial.printf("CPU probe baseline: %u counts/ms on core %d\n\n",
+                (unsigned)s_baselineRate, BENCH_CORE);
 
   for (unsigned c = 0; c < sizeof(kConfigs) / sizeof(kConfigs[0]); c++) {
-    for (unsigned m = 0; m < sizeof(models) / sizeof(models[0]); m++) {
-      runOne(kConfigs[c], models[m]);
-      delay(200); // let the driver settle between runs
+    for (unsigned r = 0; r < sizeof(kRows) / sizeof(kRows[0]); r++) {
+      runRow(kConfigs[c], kRows[r]);
+      delay(150);
     }
     Serial.println();
   }
 
   Serial.println("=== done ===");
-  Serial.println("Lowest ring with 0 underruns and acceptable cpu% is the floor");
-  Serial.println("for that feed model. Compare ISR against task/1-frame: the gap");
-  Serial.println("is what leaving M16's audio core would buy.");
+  Serial.println("cpu% is real CPU taken from a low-priority counter, so it includes");
+  Serial.println("the IDF interrupt dispatch. STARVED is the only true underrun column;");
+  Serial.println("qovf is just the unused send queue overflowing. The two ISR rows differ");
+  Serial.println("only in the fill, so their gap is the cost of reading PSRAM.");
 }
 
-void loop() {
-  delay(1000);
-}
+void loop() { delay(1000); }

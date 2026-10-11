@@ -674,3 +674,135 @@ desfeita** antes da fase E.
 | `PROBE: no audio within 50000 us` | `.wav` começa em silêncio, ou divisor desconectado |
 | `PROBE` com `noise` alto | divisor mal contactado, ou terra ruim |
 | Fantasma só depois de montar o RC | glitch de contato, alongado pelo filtro — ver fase I |
+
+---
+
+## 9. Banco de medição de I/O I2S — 14/08/2026
+
+Sessão sem botões e sem cartão: só o DAC, para medir o transporte de áudio e
+decidir a arquitetura do motor. Sketch em
+[../src/test_i2s_bench.cpp](../src/test_i2s_bench.cpp), ambiente `i2s_bench`.
+
+A pergunta: ficar na task de áudio da M16, ou alimentar o DMA por ISR e
+escrever o motor? Até aqui a discussão era leitura de código e aritmética.
+
+### Três modelos de alimentação, nove profundidades de ring
+
+Carga idêntica nos três: quatro vozes lidas da PSRAM pelo mixer real
+(`mixer.h`, ganho Q8 e joelho suave). `cpu%` é CPU de verdade, medido por uma
+task de prioridade 1 contando num laço contra linha de base ociosa — então
+inclui o despacho de interrupção do IDF, que não aparece de dentro do callback.
+
+| Ring | ISR `on_sent` | task, bloco | task, 1 frame (M16 hoje) |
+|---|---|---|---|
+| 46,44 ms | 2,1% | 2,3% | 21,3% |
+| 11,61 ms | 2,2% | 3,0% | 21,9% |
+| 5,80 ms | 2,4% | 3,9% | 22,7% |
+| 2,90 ms | 2,8% | 5,8% | 24,3% |
+| 1,45 ms | 3,6% | 9,5% | 27,4% |
+| 0,73 ms | 3,6% | 16,9% | 33,6% |
+| 0,36 ms | 5,2% | 17,0% | 33,6% |
+
+**Nenhuma configuração foi rejeitada pelo driver**, até `2 × 8` = 16 frames =
+0,36 ms. O piso que a escada do `main.cpp` supunha não existe.
+
+### A escrita por amostra é o gargalo, e o conserto é mais barato do que trocar de arquitetura
+
+A M16 chama `i2s_channel_write()` com 4 bytes, 44.100 vezes por segundo. Medido:
+**~1.126 ciclos por frame só na chamada de driver** (22,7% de um core a 5,8 ms,
+dos quais 110 ciclos são o preenchimento).
+
+Mas **trocar para escrita por bloco já recupera quase tudo**: 21,3% → 2,3%.
+Isso não estava na discussão original, que estava posta como "task+float *ou*
+ISR+ponto fixo". Existe um meio.
+
+### Underrun de verdade, e onde cada modelo quebra
+
+A v1 deste banco contou `on_send_q_ovf` como underrun. Errado no modelo de ISR:
+esse evento dispara uma vez por descritor completado quando ninguém consome a
+fila de envio do driver, então contava 100% dos descritores enquanto o tom
+estava audivelmente perfeito. A v2 mede o **intervalo entre refills** e marca os
+que passam do ring inteiro — que é o que de fato significa o DAC repetir dado
+velho.
+
+- **ISR: zero `STARVED` em toda a escada**, até 0,36 ms. `gap_max` ficou em
+  100-101% do período esperado em tudo.
+- **Task: `qovf` passa a ter significado** (a fila está em uso) e começa a
+  transbordar em **1,45 ms**, piorando abaixo. Piso prático do modelo de task:
+  **~2,9 ms**.
+
+### Despacho de interrupção: ~1.380 ciclos
+
+Subtraindo o preenchimento (110 ciclos/frame × 44.100 = 2,02% constante) do CPU
+total, nas duas configurações com resolução suficiente:
+
+```
+4 x 16 (2756 int/s):  3,6% − 2,02% → 1376 ciclos/interrupção
+4 x 8  (5512 int/s):  5,2% − 2,02% → 1384 ciclos/interrupção
+```
+
+**~1.380 ciclos, 5,75 µs por interrupção.** É o termo que cresce quando a escada
+desce, e tem consequência de projeto direta:
+
+| Config | Ring | Interrupções/s | cpu% |
+|---|---|---|---|
+| `4 × 8` | 0,73 ms | 5.512 | 5,2% |
+| `2 × 16` | **0,73 ms** | 2.756 | **3,6%** |
+
+Mesma latência, metade das interrupções. **Para um ring de profundidade dada,
+descritores maiores e menos numerosos são mais baratos** — `2 × 16` domina
+`4 × 8`.
+
+### O custo de uma voz real, e o "sub-microssegundo" confirmado
+
+As duas linhas de ISR diferem só no preenchimento, então a diferença é o custo
+de ler a PSRAM:
+
+| Preenchimento | Ciclos/frame |
+|---|---|
+| 4 vozes da PSRAM pelo mixer | **110** |
+| Gerador trivial (compare + 2 stores) | 18 |
+
+**~23 ciclos por voz por frame** (96 ns a 240 MHz), incluindo leitura de PSRAM,
+ganho Q8, soma e joelho suave. O argumento que sustenta o ring raso em
+`main.cpp` — "sobra o cache miss de PSRAM, que é sub-microssegundo" — **está
+confirmado**, e agora com número em vez de adjetivo. Leitura sequencial; o cache
+dá conta.
+
+Uma previsão escrita **antes** de medir estimava ~100 ciclos/frame para quatro
+vozes e 1,8% do período em `4 × 64`. Saiu 110 ciclos/frame e 2,4%.
+
+### Jitter
+
+```
+ISR,  4 x 16:  1844 / 1847 / 2112 ciclos   (max 14% acima do min)
+task, 1 frame:  906 / 5204 / 70863 ciclos  (78x de spread)
+```
+
+### Decisão
+
+**Alvo ≥ 2,9 ms → task com escrita por bloco.** 5,8% de CPU, zero `qovf`, e
+permite **float**, porque não é contexto de ISR (a FPU do Xtensa não está
+disponível em ISR). Muito menos código que escrever o motor.
+
+**Alvo sub-milissegundo → ISR com `2 × 16` (0,73 ms) a 3,6%.** Custo: ponto fixo
+no preenchimento, e o `mixer.h` passaria a Q12 em vez de float.
+
+Recomendação: **começar pela task com bloco.** Entrega quase todo o ganho de
+CPU, mantém float, e a ISR fica como upgrade se o pitch shifter e o audio-in
+pedirem os 2 ms de volta.
+
+### Ressalvas
+
+- Tudo aqui é **saída**. Com audio-in, soma o ring de entrada e o filtro de
+  decimação do codec.
+- A resolução do `cpu%` é de 0,1 ponto, então os valores de despacho nas
+  configurações de poucas interrupções por segundo têm erro grande. Os
+  ~1.380 ciclos vêm das duas linhas de alta taxa, onde a resolução sustenta.
+- `disableCore1WDT()` retornou `Failed to remove Core 1 IDLE task from WDT`.
+  Não houve abort, provavelmente porque a IDLE do core 1 não estava inscrita
+  neste build — mas significa que a proteção que eu achei ter desligado nunca
+  estava ligada.
+- Latência absoluta continua não medida: falta a fase F. O filtro do DAC
+  (~0,50 ms, `FLT` em GND) é constante e cancela nas comparações acima, mas
+  entra em qualquer número absoluto.
