@@ -960,3 +960,38 @@ float em todo o caminho de áudio **não mudou o som**.
    não é defeito.
 
 Fase F (latência absoluta) continua pendente.
+
+### Recorrência: três vezes na mesma sessão
+
+O som caiu e voltou **três** vezes em 11/10/2026, e o padrão é mais útil que
+cada ocorrência:
+
+| # | Quando | Diagnóstico |
+|---|---|---|
+| 1 | Depois de gravar os três commits do motor novo | `DEBUG_ENGINE`: 1378 blocos/s, `peak 5327` → firmware inocente, era conexão |
+| 2 | Mexendo na conexão | Som limpo, pitch shifter funcionando |
+| 3 | Depois de gravar o build sem `DEBUG_ENGINE` | Boot único e limpo, 16 s sem reinício, sem watchdog → firmware inocente de novo |
+| 4 | Sem mudar nada no software | Som voltou |
+
+**As duas vezes que caiu foram imediatamente depois de uma gravação,** e gravar
+significa um reset via RTS e encostar na placa. O firmware foi explicitamente
+descartado nas duas: na primeira por medição do caminho de áudio, na segunda
+porque o único diff era um `Serial.printf` no `loop()` e não houve panic nem
+reinício.
+
+Isso localiza a falha numa **junta mecânica**, não no DAC e não no código. Não
+é o XSMT mudo (que daria silêncio estável, não intermitente ligado a
+manipulação). A hipótese que sobra é um dos fios de dados ou de alimentação
+cujo contato cede com movimento.
+
+Enquanto isso não for resolvido fisicamente, **qualquer** julgamento de ouvido
+nesta bancada carrega esse ruído: um "não tocou" só vale depois de uma linha de
+`DEBUG_ENGINE` confirmando que o firmware está produzindo sinal.
+
+```bash
+PLATFORMIO_BUILD_FLAGS='-DDEBUG_ENGINE=1' pio run -e esp32-s3-devkitc-1 -t upload
+```
+
+Os dois diagnósticos (`DEBUG_ENGINE`, `DEBUG_TRIGGERS`) são `#ifndef`-guarded
+justamente para isso: ligar num build sem editar — e sem esquecer de reverter —
+um arquivo versionado.

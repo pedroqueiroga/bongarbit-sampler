@@ -114,8 +114,15 @@ static_assert(DMA_BUFFERS * DMA_BUFFER_LENGTH <= 512,
 // Serial over USB CDC blocks when the host is not draining the buffer, which
 // puts an unbounded stall directly in the trigger path. Off by default: turn
 // it on to diagnose an input problem, never while judging latency.
+// The two diagnostics are #ifndef-guarded, same convention as every other knob
+// in this file, so they can be flipped for one build without editing (and then
+// forgetting to revert) a tracked file:
+//
+//   PLATFORMIO_BUILD_FLAGS='-DDEBUG_ENGINE=1' pio run -e esp32-s3-devkitc-1 -t upload
 #define DEBUG_BOOT     1
-#define DEBUG_TRIGGERS 0
+#ifndef DEBUG_TRIGGERS
+  #define DEBUG_TRIGGERS 0
+#endif
 
 // DEBUG_ENGINE prints one line per second from loop() with the state of the
 // whole audio path: blocks rendered, peak sample produced, which voices think
@@ -140,7 +147,9 @@ static_assert(DMA_BUFFERS * DMA_BUFFER_LENGTH <= 512,
 // last instruction before the DMA. The fault was a connection, the same class
 // of fault that had already cost this project a full bench session while a
 // dead GPIO was blamed instead.
-#define DEBUG_ENGINE   0
+#ifndef DEBUG_ENGINE
+  #define DEBUG_ENGINE 0
+#endif
 #if DEBUG_BOOT
   #define DBG(...) Serial.printf(__VA_ARGS__)
 #else
