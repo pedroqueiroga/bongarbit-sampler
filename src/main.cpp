@@ -24,21 +24,33 @@
  */
 
 // --- Audio output latency (MUST be set before including M16.h) ---
-// M16 feeds the I2S DMA ring one sample at a time and blocks when it is full,
-// so the ring depth IS the trigger-to-sound latency, essentially all of it.
-// The library default is 4 x 512 = 2048 frames = 46ms at 44.1kHz, sized to
-// survive a flash sector erase on the host (~30-40ms).
+// The I2S DMA ring is where the trigger-to-sound time is spent. The library
+// default is 4 x 512 = 2048 frames = 46ms at 44.1kHz, sized to survive a flash
+// sector erase on the host (~30-40ms).
+//
+// M16 drains it in M16_BLOCK_SIZE (32) frame bursts: audioBlockWrite()
+// accumulates a block and issues one i2s_channel_write() per 32 frames, which
+// is what paces the audio task. It fed the ring one frame per driver call
+// until the library changed under this project - see the pin note in
+// platformio.ini. That is why the pin exists, and why the ring depth is the
+// figure to tune rather than anything about how it gets filled.
 //
 // That worst case does not exist in this firmware: samples are resident in
 // PSRAM, the SD card is never touched after boot, there is no WiFi, and
 // nothing writes to flash at runtime. The only producer stall left is a PSRAM
-// cache miss inside audioUpdate(), which is sub-microsecond. M16's own comment
-// names this exact case as the reason the values are overridable
-// ("percussive/Beat Machine style").
+// cache miss inside audioUpdate(), measured at ~110 cycles per frame for four
+// voices (docs/bancada.md section 9). M16's own comment names this exact case
+// as the reason the values are overridable ("percussive/Beat Machine style").
 //
-// 4 x 64 = 256 frames = 5.8ms. VALIDATED on hardware 13/08/2026: clean on a
+// 4 x 64 = 256 frames = 5.8ms. Validated on hardware 13/08/2026: clean on a
 // fast roll with all four voices sounding at once, which is the heaviest
 // audioUpdate() path. See docs/bancada.md, "Fase E".
+//
+// That validation is PROVISIONAL as of 11/10/2026. It was measured against an
+// M16 checkout that no longer exists, from before the transport changed, and
+// the ring is now drained in 32-frame bursts rather than one frame per driver
+// call. The value is almost certainly still fine - bursts drain a ring faster,
+// not slower - but it has not been re-confirmed by ear on this pin.
 //
 // Getting that answer required removing two confounds that both sound exactly
 // like an underrun, and which made 5.8ms appear to fail:
@@ -438,5 +450,11 @@ void audioUpdate() {
   mixR = mixApplyGain(mixR, masterGain);
 #endif
 
-  i2s_write_samples(MIXCLIP(mixL), MIXCLIP(mixR));
+  // audioBlockWrite(), not the older i2s_write_samples(), which is now a
+  // [[deprecated]] shim over it AND returns false without writing anything if
+  // M16's dual-core block-split mode is ever active. It clips to 16 bits
+  // itself, which is a no-op here: MIXCLIP already guarantees the range, and
+  // doing it in mixer.h is what lets the soft knee be the thing that shapes a
+  // peak collision rather than a hard clamp.
+  audioBlockWrite(MIXCLIP(mixL), MIXCLIP(mixR));
 }
